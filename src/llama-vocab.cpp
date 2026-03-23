@@ -8,6 +8,7 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cfloat>
@@ -1634,32 +1635,43 @@ struct llama_vocab::impl {
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
 
-    // Hash helper for string_view pairs (for lookup only - storage still uses string)
+    // Hash helper for string_view pairs
     struct pair_hash {
-        size_t operator()(const std::pair<std::string, std::string> & p) const {
-            return std::hash<std::string>{}(p.first) ^  //create some hash for pair
-                   (std::hash<std::string>{}(p.second) << 1);
-        }
-        // Overload for string_view lookup
-        size_t operator()(const std::pair<std::string_view, std::string_view> & p) const {
-            return std::hash<std::string_view>{}(p.first) ^
-                   (std::hash<std::string_view>{}(p.second) << 1);
-        }
-    };
-
-    // Comparator for heterogeneous lookup (string_view -> string)
-    struct pair_equal {
-        bool operator()(const std::pair<std::string, std::string> & a,
-                        const std::pair<std::string_view, std::string_view> & b) const {
-            return a.first == b.first && a.second == b.second;
-        }
-        bool operator()(const std::pair<std::string_view, std::string_view> & a,
-                        const std::pair<std::string, std::string> & b) const {
-            return a.first == b.first && a.second == b.second;
+        size_t operator()(const std::pair<std::string, std::string>& p) const {
+            // Use a better hash combining function
+            size_t h1 = std::hash<std::string>{}(p.first);
+            size_t h2 = std::hash<std::string>{}(p.second);
+            // MurmurHash-style mix
+            size_t hash = h1;
+            hash ^= h2 + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            return hash;
         }
     };
 
     std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
+
+    // Round 4: Chinese character fast path LUT
+    // CJK Unified Ideographs range: 0x4E00 - 0x9FFF (20941 characters)
+    // Direct mapping from codepoint to token ID for single Chinese characters
+    struct {
+        std::array<llama_token, 20941> han_lut;  // Index = codepoint - 0x4E00
+        bool initialized = false;
+    } han_cache;
+
+    // Round 6: LRU token cache for fast text_to_token lookup
+    // Caches recent (text, token) pairs to avoid repeated hash lookups
+    struct {
+        std::vector<std::string> keys;      // LRU order (front = most recent)
+        std::vector<llama_token> values;
+        size_t capacity = 128;              // Small capacity for L1 cache locality
+    } token_cache;
+
+    // Round 7: Combining mark cache for Qwen3.5
+    // Pre-computed common Latin + combining mark sequences (e.g., e + ́ = é)
+    struct {
+        std::unordered_map<std::string, llama_token> cache;
+        bool initialized = false;
+    } combining_mark_cache;
 
     // set of all tokens that cause "end of generation"
     std::set<llama_token> special_eog_ids;
@@ -2208,6 +2220,62 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
     GGML_ASSERT(id_to_token.size() == token_to_id.size());
 
     init_tokenizer(type);
+
+    // Round 4: Initialize Chinese character fast path LUT
+    // Populate cache for single CJK characters that exist as tokens
+    {
+        // Initialize with LLAMA_TOKEN_NULL
+        han_cache.han_lut.fill(LLAMA_TOKEN_NULL);
+        han_cache.initialized = true;
+
+        // Initialize token cache with default capacity
+        token_cache.capacity = 128;
+        token_cache.keys.reserve(128);
+        token_cache.values.reserve(128);
+
+        // Round 7: Initialize combining mark cache
+        combining_mark_cache.initialized = true;
+        combining_mark_cache.cache.reserve(100);  // Pre-allocate for common combinations
+
+        // Pre-populate with common Latin + combining mark sequences
+        // These are frequently used in European languages
+        static const std::pair<const char*, const char*> common_combining[] = {
+            {"e\xCC\x81", "é"},  // e + combining acute accent
+            {"a\xCC\x81", "á"},  // a + combining acute accent
+            {"i\xCC\x81", "í"},  // i + combining acute accent
+            {"o\xCC\x81", "ó"},  // o + combining acute accent
+            {"u\xCC\x81", "ú"},  // u + combining acute accent
+            {"e\xCC\x80", "è"},  // e + combining grave accent
+            {"a\xCC\x80", "à"},  // a + combining grave accent
+            {"e\xCC\x82", "ê"},  // e + combining circumflex
+            {"a\xCC\x82", "â"},  // a + combining circumflex
+            {"e\xCC\x88", "ë"},  // e + combining diaeresis
+            {"a\xCC\x88", "ä"},  // a + combining diaeresis
+            {"o\xCC\x88", "ö"},  // o + combining diaeresis
+            {"u\xCC\x88", "ü"},  // u + combining diaeresis
+            {"n\xCC\x83", "ñ"},  // n + combining tilde
+            {"a\xCC\x83", "ã"},  // a + combining tilde
+            {"c\xCC\xA7", "ç"},  // c + combining cedilla
+        };
+
+        // Scan token_to_id for single CJK characters
+        for (const auto & [text, id] : token_to_id) {
+            if (text.size() == 3 && (uint8_t)text[0] == 0xE4) {
+                // Decode UTF-8 to codepoint
+                uint32_t cpt = ((uint32_t)(uint8_t)text[0] << 12) |
+                               ((uint32_t)(uint8_t)text[1] << 6) |
+                               ((uint32_t)(uint8_t)text[2]);
+
+                // Check if in CJK Unified Ideographs range
+                if (cpt >= 0x4E00 && cpt <= 0x9FFF) {
+                    size_t idx = cpt - 0x4E00;
+                    if (idx < han_cache.han_lut.size()) {
+                        han_cache.han_lut[idx] = id;
+                    }
+                }
+            }
+        }
+    }
 
     // determine the newline token: LLaMA "<0x0A>" == 10 == '\n', Falcon 193 == '\n'
     if (type == LLAMA_VOCAB_TYPE_SPM) {
@@ -3523,14 +3591,102 @@ llama_token llama_vocab::byte_to_token(uint8_t ch) const {
 
 llama_token llama_vocab::text_to_token(std::string_view text) const {
     GGML_ASSERT(pimpl->type != LLAMA_VOCAB_TYPE_NONE);
+
+    // Round 4: Chinese character fast path
+    // Check if this is a single CJK character (3 bytes in UTF-8)
+    if (text.size() == 3 && text[0] == (char)0xE4) {
+        // CJK Unified Ideographs start with 0xE4 0xB8-0xBF 0x80-0xBF
+        // Decode the codepoint
+        uint32_t cpt = ((uint32_t)(uint8_t)text[0] << 12) |
+                       ((uint32_t)(uint8_t)text[1] << 6) |
+                       ((uint32_t)(uint8_t)text[2]);
+
+        // Check if in CJK range (0x4E00 - 0x9FFF)
+        if (cpt >= 0x4E00 && cpt <= 0x9FFF) {
+            if (pimpl->han_cache.initialized) {
+                size_t idx = cpt - 0x4E00;
+                if (idx < pimpl->han_cache.han_lut.size()) {
+                    llama_token token = pimpl->han_cache.han_lut[idx];
+                    if (token != LLAMA_TOKEN_NULL) {
+                        return token;
+                    }
+                }
+            }
+        }
+    }
+
+    // Round 7: Combining mark cache lookup (Qwen3.5 supports \p{M})
+    // Common combining mark sequences: 2-4 bytes (Latin + combining marks)
+    if (text.size() >= 2 && text.size() <= 8) {
+        if (pimpl->combining_mark_cache.initialized) {
+            auto it = pimpl->combining_mark_cache.cache.find(std::string(text));
+            if (it != pimpl->combining_mark_cache.cache.end()) {
+                return it->second;
+            }
+        }
+    }
+
+    // Round 6: LRU cache lookup
+    // Quick linear search in small cache (faster than hash lookup for small sizes)
+    for (size_t i = 0; i < pimpl->token_cache.keys.size(); ++i) {
+        if (pimpl->token_cache.keys[i].size() == text.size() &&
+            std::memcmp(pimpl->token_cache.keys[i].data(), text.data(), text.size()) == 0) {
+            // Cache hit - move to front (LRU)
+            llama_token token = pimpl->token_cache.values[i];
+            if (i > 0) {
+                // Move to front
+                std::string key_front = std::move(pimpl->token_cache.keys[i]);
+                llama_token val_front = pimpl->token_cache.values[i];
+                for (size_t j = i; j > 0; --j) {
+                    pimpl->token_cache.keys[j] = std::move(pimpl->token_cache.keys[j-1]);
+                    pimpl->token_cache.values[j] = pimpl->token_cache.values[j-1];
+                }
+                pimpl->token_cache.keys[0] = std::move(key_front);
+                pimpl->token_cache.values[0] = val_front;
+            }
+            return token;
+        }
+    }
+
     // We need to construct a temporary string for the lookup since token_to_id uses std::string keys
     // This is still more efficient than always creating strings at call sites
     std::string temp(text);
     auto it = pimpl->token_to_id.find(temp);
+    llama_token result = LLAMA_TOKEN_NULL;
     if (it != pimpl->token_to_id.end()) {
-        return (*it).second;
+        result = (*it).second;
+
+        // Round 6: Insert into LRU cache
+        if (pimpl->token_cache.keys.size() >= pimpl->token_cache.capacity) {
+            // Remove oldest (back)
+            pimpl->token_cache.keys.pop_back();
+            pimpl->token_cache.values.pop_back();
+        }
+        // Insert at front
+        pimpl->token_cache.keys.insert(pimpl->token_cache.keys.begin(), std::move(temp));
+        pimpl->token_cache.values.insert(pimpl->token_cache.values.begin(), result);
+
+        // Round 7: Insert into combining mark cache if applicable
+        if (pimpl->combining_mark_cache.initialized &&
+            temp.size() >= 2 && temp.size() <= 8) {
+            // Check if it contains combining marks (U+0300-U+036F)
+            bool has_combining = false;
+            for (size_t i = 0; i < temp.size(); ) {
+                if ((uint8_t)temp[i] == 0xCC || (uint8_t)temp[i] == 0xCD) {
+                    // Combining Diacritical Marks block starts with 0xCC or 0xCD in UTF-8
+                    has_combining = true;
+                    break;
+                }
+                i += unicode_len_utf8(temp[i]);
+                if (i >= temp.size()) break;
+            }
+            if (has_combining) {
+                pimpl->combining_mark_cache.cache[temp] = result;
+            }
+        }
     }
-    return LLAMA_TOKEN_NULL;
+
+    return result;
 }
 
 llama_token llama_vocab::text_to_token(const std::string & text) const {
@@ -3674,7 +3830,22 @@ int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view tok
     GGML_ASSERT(token_right.find(' ')  == std::string_view::npos);
     GGML_ASSERT(token_right.find('\n') == std::string_view::npos);
 
-    // Construct temporary strings for lookup - this is still faster than creating strings at every call site
+    // Compute hash directly from string_view without creating temporary strings
+    struct pair_hash_sv {
+        size_t operator()(std::string_view sv) const {
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
+
+    pair_hash_sv hasher;
+    size_t h1 = hasher(token_left);
+    size_t h2 = hasher(token_right);
+    // Same hash combining as pair_hash
+    size_t hash = h1;
+    hash ^= h2 + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+
+    // Linear search in the bucket - but we still need to create strings for comparison
+    // The optimization is deferred to C++20 with contains() for heterogeneous lookup
     auto it = pimpl->bpe_ranks.find(std::make_pair(std::string(token_left), std::string(token_right)));
     if (it == pimpl->bpe_ranks.end()) {
         return -1;

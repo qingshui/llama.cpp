@@ -218,6 +218,10 @@ static std::vector<size_t> unicode_regex_split_custom_gpt2(const std::string & t
 
     const auto cpts = unicode_cpts_from_utf8(text);
 
+    // Round 3 optimization: pre-compute flags array for direct access
+    static const auto cpt_flags = unicode_cpt_flags_array();
+    static const unicode_cpt_flags undef(unicode_cpt_flags::UNDEFINED);
+
     size_t start = 0;
     for (auto offset : offsets) {
         const size_t offset_ini = start;
@@ -230,8 +234,11 @@ static std::vector<size_t> unicode_regex_split_custom_gpt2(const std::string & t
             return (offset_ini <= pos && pos < offset_end) ? cpts[pos] : OUT_OF_RANGE;
         };
 
-        auto _get_flags = [&] (const size_t pos) -> unicode_cpt_flags {
-            return (offset_ini <= pos && pos < offset_end) ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+        // Fast path: direct array access instead of function call
+        auto _get_flags = [&] (const size_t pos) -> const unicode_cpt_flags& {
+            if (!(offset_ini <= pos && pos < offset_end)) return undef;
+            uint32_t cpt = cpts[pos];
+            return cpt < cpt_flags.size() ? cpt_flags[cpt] : undef;
         };
 
         size_t _prev_end = offset_ini;
@@ -336,6 +343,10 @@ static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string &
 
     const auto cpts = unicode_cpts_from_utf8(text);
 
+    // Round 3 optimization: pre-compute flags array for direct access
+    static const auto cpt_flags = unicode_cpt_flags_array();
+    static const unicode_cpt_flags undef(unicode_cpt_flags::UNDEFINED);
+
     size_t start = 0;
     for (auto offset : offsets) {
         const size_t offset_ini = start;
@@ -348,8 +359,11 @@ static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string &
             return (offset_ini <= pos && pos < offset_end) ? cpts[pos] : OUT_OF_RANGE;
         };
 
-        auto _get_flags = [&] (const size_t pos) -> unicode_cpt_flags {
-            return (offset_ini <= pos && pos < offset_end) ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+        // Fast path: direct array access instead of function call
+        auto _get_flags = [&] (const size_t pos) -> const unicode_cpt_flags& {
+            if (!(offset_ini <= pos && pos < offset_end)) return undef;
+            uint32_t cpt = cpts[pos];
+            return cpt < cpt_flags.size() ? cpt_flags[cpt] : undef;
         };
 
         size_t _prev_end = offset_ini;
@@ -515,6 +529,10 @@ static std::vector<size_t> unicode_regex_split_custom_kimi_k2(const std::string 
 
     const auto cpts = unicode_cpts_from_utf8(text);
 
+    // Round 3 optimization: pre-compute flags array for direct access
+    static const auto cpt_flags = unicode_cpt_flags_array();
+    static const unicode_cpt_flags undef(unicode_cpt_flags::UNDEFINED);
+
     size_t start = 0;
     for (auto offset : offsets) {
         const size_t offset_ini = start;
@@ -527,8 +545,11 @@ static std::vector<size_t> unicode_regex_split_custom_kimi_k2(const std::string 
             return (offset_ini <= pos && pos < offset_end) ? cpts[pos] : OUT_OF_RANGE;
         };
 
-        auto _get_flags = [&] (const size_t pos) -> unicode_cpt_flags {
-            return (offset_ini <= pos && pos < offset_end) ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+        // Fast path: direct array access instead of function call
+        auto _get_flags = [&] (const size_t pos) -> const unicode_cpt_flags& {
+            if (!(offset_ini <= pos && pos < offset_end)) return undef;
+            uint32_t cpt = cpts[pos];
+            return cpt < cpt_flags.size() ? cpt_flags[cpt] : undef;
         };
 
         size_t _prev_end = offset_ini;
@@ -686,6 +707,10 @@ static std::vector<size_t> unicode_regex_split_custom_afmoe(const std::string & 
 
     const auto cpts = unicode_cpts_from_utf8(text);
 
+    // Round 3 optimization: pre-compute flags array for direct access
+    static const auto cpt_flags = unicode_cpt_flags_array();
+    static const unicode_cpt_flags undef(unicode_cpt_flags::UNDEFINED);
+
     size_t start = 0;
     for (auto offset : offsets) {
         const size_t offset_ini = start;
@@ -693,8 +718,11 @@ static std::vector<size_t> unicode_regex_split_custom_afmoe(const std::string & 
         assert(offset_end <= cpts.size());
         start = offset_end;
 
-        auto _get_flags = [&] (const size_t pos) -> unicode_cpt_flags {
-            return (offset_ini <= pos && pos < offset_end) ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+        // Fast path: direct array access instead of function call
+        auto _get_flags = [&] (const size_t pos) -> const unicode_cpt_flags& {
+            if (!(offset_ini <= pos && pos < offset_end)) return undef;
+            uint32_t cpt = cpts[pos];
+            return cpt < cpt_flags.size() ? cpt_flags[cpt] : undef;
         };
 
         size_t _prev_end = offset_ini;
@@ -943,6 +971,15 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
         { unicode_cpt_flags::SYMBOL,      "\\\x24\\\x2B\x3C-\x3E\x5E\x60\\\x7C" }, // $+<=>^`|
     };
 
+    // Pre-compute unicode flags array for fast direct access (Round 3 optimization)
+    static const auto cpt_flags = unicode_cpt_flags_array();
+    static const unicode_cpt_flags undef(unicode_cpt_flags::UNDEFINED);
+
+    // Fast inline flag access - avoids function call overhead in hot loops
+    auto get_flags_fast = [&](uint32_t cpt) -> const unicode_cpt_flags& {
+        return cpt < cpt_flags.size() ? cpt_flags[cpt] : undef;
+    };
+
     // compute collapsed codepoints only if needed by at least one regex
     bool need_collapse = false;
     for (const auto & regex_expr : regex_exprs) {
@@ -971,7 +1008,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
                 continue;
             }
 
-            const auto flags = unicode_cpt_flags_from_cpt(cpts[i]);
+            const auto& flags = get_flags_fast(cpts[i]);
 
             if (flags.is_whitespace) {
                 //NOTE: C++ std::regex \s does not mach 0x85, Rust and Python regex does.
