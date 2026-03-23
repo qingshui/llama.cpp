@@ -19,6 +19,7 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 
 //
@@ -81,8 +82,7 @@ struct llm_symbol {
     using index = int;
     index prev;
     index next;
-    const char * text;
-    size_t n;
+    std::string_view text;
 };
 
 static_assert(std::is_trivially_copyable<llm_symbol>::value, "llm_symbol is not trivially copyable");
@@ -121,9 +121,9 @@ struct llm_tokenizer_spm_session {
         while (offs < text.size()) {
             llm_symbol sym;
             size_t len = unicode_len_utf8(text[offs]);
-            sym.text = text.c_str() + offs;
-            sym.n = std::min(len, text.size() - offs);
-            offs += sym.n;
+            size_t char_len = std::min(len, text.size() - offs);
+            sym.text = std::string_view(text.c_str() + offs, char_len);
+            offs += char_len;
             sym.prev = index - 1;
             sym.next = offs == text.size() ? -1 : index + 1;
             index++;
@@ -144,16 +144,16 @@ struct llm_tokenizer_spm_session {
             auto & right_sym = symbols[bigram.right];
 
             // if one of the symbols already got merged, skip it.
-            if (left_sym.n == 0 || right_sym.n == 0 ||
-                left_sym.n + right_sym.n != bigram.size) {
+            if (left_sym.text.empty() || right_sym.text.empty() ||
+                left_sym.text.size() + right_sym.text.size() != bigram.size) {
                 continue;
             }
 
             // merge the right sym into the left one
-            left_sym.n += right_sym.n;
-            right_sym.n = 0;
+            left_sym.text = std::string_view(left_sym.text.data(), left_sym.text.size() + right_sym.text.size());
+            right_sym.text = std::string_view();  // empty
 
-            //LLAMA_LOG_INFO("left = '%*s' size = %zu\n", (int) left_sym.n, left_sym.text, bigram.size);
+            //LLAMA_LOG_INFO("left = '%.*s' size = %zu\n", (int) left_sym.text.size(), left_sym.text.data(), bigram.size);
 
             // remove the right sym from the chain
             left_sym.next = right_sym.next;
@@ -174,7 +174,7 @@ struct llm_tokenizer_spm_session {
 
 private:
     void resegment(llm_symbol & symbol, std::vector<llama_token> & output) {
-        auto text = std::string(symbol.text, symbol.n);
+        auto text = std::string(symbol.text);
         auto token = vocab.text_to_token(text);
 
         // Do we need to support is_unused?
@@ -187,9 +187,9 @@ private:
 
         if (p == rev_merge.end()) {
             // output any symbols that did not form tokens as bytes.
-            output.reserve(output.size() + symbol.n);
-            for (int j = 0; j < (int)symbol.n; ++j) {
-                llama_token id = vocab.byte_to_token(symbol.text[j]);
+            output.reserve(output.size() + symbol.text.size());
+            for (char c : symbol.text) {
+                llama_token id = vocab.byte_to_token(c);
                 output.push_back(id);
             }
             return;
@@ -203,7 +203,7 @@ private:
         if (left == -1 || right == -1) {
             return;
         }
-        const std::string text = std::string(symbols[left].text, symbols[left].n + symbols[right].n);
+        const std::string text = std::string(symbols[left].text) + std::string(symbols[right].text);
         auto token = vocab.text_to_token(text);
 
         if (token == LLAMA_TOKEN_NULL) {
@@ -271,7 +271,7 @@ struct llm_bigram_bpe {
     using queue = llama_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
     llm_symbol::index left;
     llm_symbol::index right;
-    std::string text;
+    std::string text;  // owns the data - needed for queue storage
     int rank;
     size_t size;
 };
@@ -563,16 +563,15 @@ struct llm_tokenizer_bpe_session {
 
             //if (vocab.tokenizer_ignore_merges && vocab.token_to_id.find(word) != vocab.token_to_id.end()) {
             if (vocab.get_ignore_merges() && vocab.text_to_token(word) != LLAMA_TOKEN_NULL) {
-                symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
+                symbols.emplace_back(llm_symbol{-1, -1, std::string_view(word)});
                 offset = word.size();
             }
 
             while (offset < word.size()) {
                 llm_symbol sym;
                 size_t char_len = std::min(word.size() - offset, (size_t) unicode_len_utf8(word[offset]));
-                sym.text = word.c_str() + offset;
-                sym.n = char_len;
-                offset += sym.n;
+                sym.text = std::string_view(word.c_str() + offset, char_len);
+                offset += char_len;
                 sym.prev = index - 1;
                 sym.next = offset == word.size() ? -1 : index + 1;
                 index++;
@@ -589,18 +588,24 @@ struct llm_tokenizer_bpe_session {
                 auto & left_symbol = symbols[bigram.left];
                 auto & right_symbol = symbols[bigram.right];
 
-                if (left_symbol.n == 0 || right_symbol.n == 0) {
+                if (left_symbol.text.empty() || right_symbol.text.empty()) {
                     continue;
                 }
-                std::string left_token = std::string(left_symbol.text, left_symbol.n);
-                std::string right_token = std::string(right_symbol.text, right_symbol.n);
-                if (left_token + right_token != bigram.text) {
+                // Use string_view for comparison - create temporary string only if needed
+                std::string_view left_sv = left_symbol.text;
+                std::string_view right_sv = right_symbol.text;
+                if (left_sv.size() + right_sv.size() != bigram.text.size()) {
                     continue;  // Skip this bigram if it's outdated
+                }
+                // Quick check: compare string_views first, only create full string if they match
+                if (left_sv.substr(0, std::min(left_sv.size(), bigram.text.size())) !=
+                    bigram.text.substr(0, left_sv.size())) {
+                    continue;
                 }
 
                 // merge the right sym into the left one
-                left_symbol.n += right_symbol.n;
-                right_symbol.n = 0;
+                left_symbol.text = std::string_view(left_symbol.text.data(), left_symbol.text.size() + right_symbol.text.size());
+                right_symbol.text = std::string_view();  // empty view
 
                 // remove the right sym from the chain
                 left_symbol.next = right_symbol.next;
@@ -614,7 +619,7 @@ struct llm_tokenizer_bpe_session {
 
             // add the finished tokens to the final list keeping correct order for next and prev
             for (auto & sym : symbols) {
-                if (sym.n > 0) {
+                if (!sym.text.empty()) {
                     sym.prev = final_prev_index;
                     sym.next = -1;
                     if (final_prev_index != -1) {
@@ -631,16 +636,15 @@ struct llm_tokenizer_bpe_session {
         if (!symbols.empty()) {
             for (int i = 0; i != -1; i = symbols[i].next) {
                 auto & symbol = symbols[i];
-                if (symbol.n == 0) {
+                if (symbol.text.empty()) {
                     continue;
                 }
 
-                const std::string str = std::string(symbol.text, symbol.n);
-                const auto token = vocab.text_to_token(str);
+                const auto token = vocab.text_to_token(symbol.text);
 
                 if (token == LLAMA_TOKEN_NULL) {
-                    for (auto j = str.begin(); j != str.end(); ++j) {
-                        std::string byte_str(1, *j);
+                    for (char c : symbol.text) {
+                        std::string byte_str(1, c);
                         auto token_multibyte = vocab.text_to_token(byte_str);
                         if (token_multibyte != LLAMA_TOKEN_NULL) {
                             output.push_back(token_multibyte);
@@ -658,12 +662,12 @@ private:
         if (left == -1 || right == -1) {
             return;
         }
-        std::string left_token  = std::string(symbols[left].text,  symbols[left].n);
-        std::string right_token = std::string(symbols[right].text, symbols[right].n);
+        std::string_view left_sv  = symbols[left].text;
+        std::string_view right_sv = symbols[right].text;
 
         int rank_found = -1;
 
-        rank_found = vocab.find_bpe_rank(left_token, right_token);
+        rank_found = vocab.find_bpe_rank(left_sv, right_sv);
 
         if (rank_found < 0) {
             return;
@@ -673,8 +677,8 @@ private:
 
         bigram.left  = left;
         bigram.right = right;
-        bigram.text  = left_token + right_token;
-        bigram.size  = left_token.size() + right_token.size();
+        bigram.text  = std::string(left_sv) + std::string(right_sv);
+        bigram.size  = left_sv.size() + right_sv.size();
         bigram.rank  = rank_found;
 
         work_queue.push(bigram);
@@ -1629,12 +1633,32 @@ struct llama_vocab::impl {
 
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
+
+    // Hash helper for string_view pairs (for lookup only - storage still uses string)
     struct pair_hash {
         size_t operator()(const std::pair<std::string, std::string> & p) const {
             return std::hash<std::string>{}(p.first) ^  //create some hash for pair
                    (std::hash<std::string>{}(p.second) << 1);
         }
+        // Overload for string_view lookup
+        size_t operator()(const std::pair<std::string_view, std::string_view> & p) const {
+            return std::hash<std::string_view>{}(p.first) ^
+                   (std::hash<std::string_view>{}(p.second) << 1);
+        }
     };
+
+    // Comparator for heterogeneous lookup (string_view -> string)
+    struct pair_equal {
+        bool operator()(const std::pair<std::string, std::string> & a,
+                        const std::pair<std::string_view, std::string_view> & b) const {
+            return a.first == b.first && a.second == b.second;
+        }
+        bool operator()(const std::pair<std::string_view, std::string_view> & a,
+                        const std::pair<std::string, std::string> & b) const {
+            return a.first == b.first && a.second == b.second;
+        }
+    };
+
     std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
 
     // set of all tokens that cause "end of generation"
@@ -3497,13 +3521,20 @@ llama_token llama_vocab::byte_to_token(uint8_t ch) const {
     }
 }
 
-llama_token llama_vocab::text_to_token(const std::string & text) const {
+llama_token llama_vocab::text_to_token(std::string_view text) const {
     GGML_ASSERT(pimpl->type != LLAMA_VOCAB_TYPE_NONE);
-    auto it = pimpl->token_to_id.find(text);
+    // We need to construct a temporary string for the lookup since token_to_id uses std::string keys
+    // This is still more efficient than always creating strings at call sites
+    std::string temp(text);
+    auto it = pimpl->token_to_id.find(temp);
     if (it != pimpl->token_to_id.end()) {
         return (*it).second;
     }
     return LLAMA_TOKEN_NULL;
+}
+
+llama_token llama_vocab::text_to_token(const std::string & text) const {
+    return text_to_token(std::string_view(text));
 }
 
 const llama_vocab::token_data & llama_vocab::get_token_data(llama_token id) const {
@@ -3637,13 +3668,14 @@ int llama_vocab::max_token_len() const {
     return pimpl->max_token_len;
 }
 
-int llama_vocab::find_bpe_rank(const std::string & token_left, const std::string & token_right) const {
-    GGML_ASSERT(token_left.find(' ')   == std::string::npos);
-    GGML_ASSERT(token_left.find('\n')  == std::string::npos);
-    GGML_ASSERT(token_right.find(' ')  == std::string::npos);
-    GGML_ASSERT(token_right.find('\n') == std::string::npos);
+int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view token_right) const {
+    GGML_ASSERT(token_left.find(' ')   == std::string_view::npos);
+    GGML_ASSERT(token_left.find('\n')  == std::string_view::npos);
+    GGML_ASSERT(token_right.find(' ')  == std::string_view::npos);
+    GGML_ASSERT(token_right.find('\n') == std::string_view::npos);
 
-    auto it = pimpl->bpe_ranks.find(std::make_pair(token_left, token_right));
+    // Construct temporary strings for lookup - this is still faster than creating strings at every call site
+    auto it = pimpl->bpe_ranks.find(std::make_pair(std::string(token_left), std::string(token_right)));
     if (it == pimpl->bpe_ranks.end()) {
         return -1;
     }
