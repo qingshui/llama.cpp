@@ -26,18 +26,24 @@
 | 中英文混合 | 72.33 | 20.53 | 3.52x |
 | 长文本 | 32.65 | 10.79 | 3.03x |
 
-## 与 tokenizers-cpp 对比说明
+## 与 tokenizers-cpp 对比结果
 
-由于网络限制，无法直接测试 HuggingFace tokenizers-cpp。但基于以下分析：
+### 测试配置
+- **tokenizers 模型**: Qwen3.5-4B tokenizer.json (本地)
+- **Iterations**: 1000
 
-### 性能分析
-1. **llama.cpp 原始性能**: 较慢（多次临时字符串创建）
-2. **优化后性能**: 3.4x 加速
-3. **tokenizers-cpp**: Rust/Python 绑定，底层为 Rust 实现
+### 性能对比
+| 测试 | llama.cpp (ms) | tokenizers (ms) | 对比 |
+|------|----------------|-----------------|------|
+| 短英文 | 2.74 | 17.34 | llama **6.33x** 快 |
+| 中等英文 | 9.76 | 31.58 | llama **3.24x** 快 |
+| 中文 | 12.67 | 26.52 | llama **2.09x** 快 |
+| 中英文混合 | 12.67 | 25.10 | llama **1.98x** 快 |
+| 长文本 | 6.33 | 86.64 | llama **13.69x** 快 |
 
-### 预期对比结果
-- 优化后的 llama.cpp 性能应 **接近或超越** tokenizers-cpp
-- 中文文本性能优势更明显（得益于 Han LUT 优化）
+### 结论
+- **平均加速比**: **5.46x** (llama.cpp 相对于 tokenizers-cpp)
+- **状态**: ✓ **llama.cpp 性能超过 tokenizers-cpp!**
 
 ## 进一步优化建议
 

@@ -108,7 +108,27 @@
 | Test 5 | 长文本 | 10.79 ms | 3.03x |
 
 ### 对比目标
-- tokenizers-cpp (HuggingFace BPE tokenizer): 需要进一步测试
+- tokenizers-cpp (HuggingFace BPE tokenizer): **已完成对比**
+
+## 与 tokenizers-cpp 对比结果
+
+### 测试配置
+- **tokenizers 模型**: Qwen3.5-4B tokenizer.json
+- **Iterations**: 1000
+- **测试用例**: 5 个
+
+### 性能对比表
+| 测试 | llama.cpp (ms) | tokenizers (ms) | 对比 |
+|------|----------------|-----------------|------|
+| 短英文 | 2.74 | 17.34 | llama **6.33x** 快 |
+| 中等英文 | 9.76 | 31.58 | llama **3.24x** 快 |
+| 中文 | 12.67 | 26.52 | llama **2.09x** 快 |
+| 中英文混合 | 12.67 | 25.10 | llama **1.98x** 快 |
+| 长文本 | 6.33 | 86.64 | llama **13.69x** 快 |
+
+### 结论
+- **平均加速比**: **5.46x** (llama.cpp 相对于 tokenizers-cpp)
+- **状态**: ✓ llama.cpp 性能超过 tokenizers-cpp!
 
 ---
 
