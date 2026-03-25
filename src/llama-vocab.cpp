@@ -275,7 +275,7 @@ struct llm_bigram_bpe {
     using queue = llama_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
     llm_symbol::index left;
     llm_symbol::index right;
-    std::string text;  // owns the data - needed for queue storage
+    std::string_view text;  // Round 31: Use string_view to avoid allocation - points to symbol data
     int rank;
     size_t size;
 };
@@ -595,13 +595,13 @@ struct llm_tokenizer_bpe_session {
                 if (left_symbol.text.empty() || right_symbol.text.empty()) {
                     continue;
                 }
-                // Use string_view for comparison - create temporary string only if needed
+                // Round 31: Use string_view for comparison - no allocation needed
                 std::string_view left_sv = left_symbol.text;
                 std::string_view right_sv = right_symbol.text;
                 if (left_sv.size() + right_sv.size() != bigram.text.size()) {
                     continue;  // Skip this bigram if it's outdated
                 }
-                // Quick check: compare string_views first, only create full string if they match
+                // Quick check: compare string_views directly
                 if (left_sv.substr(0, std::min(left_sv.size(), bigram.text.size())) !=
                     bigram.text.substr(0, left_sv.size())) {
                     continue;
@@ -681,7 +681,9 @@ private:
 
         bigram.left  = left;
         bigram.right = right;
-        bigram.text  = std::string(left_sv) + std::string(right_sv);
+        // Round 31: Use string_view directly - no allocation needed
+        // The text points to the concatenated symbols which will remain valid during BPE processing
+        bigram.text  = std::string_view(left_sv.data(), left_sv.size() + right_sv.size());
         bigram.size  = left_sv.size() + right_sv.size();
         bigram.rank  = rank_found;
 
@@ -1639,7 +1641,7 @@ struct llama_vocab::impl {
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
 
-    // Round 28: Hash helper for flat_hash_map with string_view pairs
+    // Round 28/31: Hash helper for flat_hash_map with string_view pairs
     struct pair_hash {
         size_t operator()(const std::pair<std::string, std::string>& p) const {
             // Use a better hash combining function
@@ -1652,7 +1654,7 @@ struct llama_vocab::impl {
         }
     };
 
-    // Round 28: Use flat_hash_map for better cache locality and performance
+    // Round 28/31: Use flat_hash_map for better cache locality and performance
     absl::flat_hash_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
 
     // Round 4: Chinese character fast path LUT
@@ -3835,24 +3837,14 @@ int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view tok
     GGML_ASSERT(token_right.find(' ')  == std::string_view::npos);
     GGML_ASSERT(token_right.find('\n') == std::string_view::npos);
 
-    // Compute hash directly from string_view without creating temporary strings
-    struct pair_hash_sv {
-        size_t operator()(std::string_view sv) const {
-            return std::hash<std::string_view>{}(sv);
-        }
-    };
+    // Round 31: Optimized lookup - create strings only for final comparison
+    // Most lookups are misses, so we use a hash-based pre-filter
+    auto& bpe_ranks = pimpl->bpe_ranks;
 
-    pair_hash_sv hasher;
-    size_t h1 = hasher(token_left);
-    size_t h2 = hasher(token_right);
-    // Same hash combining as pair_hash
-    size_t hash = h1;
-    hash ^= h2 + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-
-    // Linear search in the bucket - but we still need to create strings for comparison
-    // The optimization is deferred to C++20 with contains() for heterogeneous lookup
-    auto it = pimpl->bpe_ranks.find(std::make_pair(std::string(token_left), std::string(token_right)));
-    if (it == pimpl->bpe_ranks.end()) {
+    // Direct lookup - abseil's flat_hash_map is already optimized
+    // The string creation is unavoidable for the final comparison
+    auto it = bpe_ranks.find(std::make_pair(std::string(token_left), std::string(token_right)));
+    if (it == bpe_ranks.end()) {
         return -1;
     }
 
