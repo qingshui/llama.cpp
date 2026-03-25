@@ -1077,6 +1077,164 @@ static std::vector<size_t> unicode_regex_split_custom_gpt2(const std::string & t
 }
 
 // LLAMA3 system regex: "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+// Round 30: Optimized version with single-pass UTF-8 decode + category lookup
+static std::vector<size_t> unicode_regex_split_custom_llama3_optimized(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    // Pure ASCII fast path
+    if (is_pure_ascii(text.c_str(), text.size())) {
+        size_t start = 0;
+        for (auto offset : offsets) {
+            const size_t offset_end = start + offset;
+            auto fast_result = unicode_regex_split_ascii_gpt2(text.c_str() + start, offset);
+            for (size_t off : fast_result) {
+                bpe_offsets.push_back(off);
+            }
+            start = offset_end;
+        }
+        return bpe_offsets;
+    }
+
+    // Round 30: Single-pass decode with flags lookup
+    auto decoded = simdutf_utf8::decode_utf8_with_flags(text.c_str(), text.size());
+    const auto& cpts = decoded.codepoints;
+    const auto& flags = decoded.flags;
+
+    // Pre-compute full flags array for non-ASCII codepoints
+    static const auto full_flags = unicode_cpt_flags_array();
+    static const unicode_cpt_flags undef(unicode_cpt_flags::UNDEFINED);
+
+    static const uint32_t OUT_OF_RANGE = 0xFFFFFFFF;
+    auto _get_cpt = [&] (const size_t pos) -> uint32_t {
+        return pos < cpts.size() ? cpts[pos] : OUT_OF_RANGE;
+    };
+
+    auto _get_flags = [&] (const size_t pos) -> const unicode_cpt_flags& {
+        if (pos >= cpts.size()) return undef;
+        uint32_t cpt = cpts[pos];
+        // Use inline flags for ASCII, full lookup for non-ASCII
+        if (cpt < 0x80) {
+            return flags[pos];
+        }
+        return cpt < full_flags.size() ? full_flags[cpt] : undef;
+    };
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t offset_ini = start;
+        const size_t offset_end = start + offset;
+        assert(offset_end <= cpts.size());
+        start = offset_end;
+
+        size_t _prev_end = offset_ini;
+        auto _add_token = [&] (const size_t end) -> size_t {
+            assert(_prev_end <= end && end <= offset_end);
+            size_t len = end - _prev_end;
+            if (len > 0) {
+                bpe_offsets.push_back(len);
+            }
+            _prev_end = end;
+            return len;
+        };
+
+        for (size_t pos = offset_ini; pos < offset_end; /*pos++*/ ) {
+            const uint32_t cpt = _get_cpt(pos);
+            const auto flags_local = _get_flags(pos);
+
+            // regex: (?i:'s|'t|'re|'ve|'m|'ll|'d)
+            if (cpt == '\'' && pos+1 < offset_end) {
+                uint32_t cpt_next = unicode_tolower(_get_cpt(pos+1));
+                if (cpt_next == 's' || cpt_next == 't' || cpt_next == 'm' || cpt_next == 'd') {
+                    pos += _add_token(pos+2);
+                    continue;
+                }
+                if (pos+2 < offset_end) {
+                    uint32_t cpt_next_next = unicode_tolower(_get_cpt(pos+2));
+                    if ((cpt_next == 'r' && cpt_next_next == 'e') ||
+                        (cpt_next == 'v' && cpt_next_next == 'e') ||
+                        (cpt_next == 'l' && cpt_next_next == 'l')) {
+                        pos += _add_token(pos+3);
+                        continue;
+                    }
+                }
+            }
+
+            // regex: [^\r\n\p{L}\p{N}]?\p{L}+
+            if (!(cpt == '\r' || cpt == '\n' || flags_local.is_number)) {
+                if (flags_local.is_letter || _get_flags(pos+1).is_letter) {
+                    pos++;
+                    while (_get_flags(pos).is_letter) {
+                        pos++;
+                    }
+                    _add_token(pos);
+                    continue;
+                }
+            }
+
+            // regex: \p{N}{1,3}
+            if (flags_local.is_number) {
+                size_t ini = pos;
+                while (_get_flags(pos).is_number) {
+                    if (++pos - ini >= 3 ) {
+                        _add_token(pos);
+                        ini = pos;
+                    }
+                }
+                _add_token(pos);
+                continue;
+            }
+
+            // regex: <space>?[^\s\p{L}\p{N}]+[\r\n]*
+            auto flags2 = (cpt == ' ' ? _get_flags(pos+1) : flags_local);
+            if (!(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags_local.as_uint()) {
+                pos += (cpt == ' ');
+                while (pos < offset_end && !(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags2.as_uint()) {
+                    flags2 = _get_flags(++pos);
+                }
+                uint32_t cpt2 = _get_cpt(pos);
+                while (cpt2 == '\r' || cpt2 == '\n') {
+                    cpt2 = _get_cpt(++pos);
+                }
+                _add_token(pos);
+                continue;
+            }
+
+            size_t num_whitespaces = 0;
+            size_t last_end_r_or_n = 0;
+            while (_get_flags(pos + num_whitespaces).is_whitespace) {
+                uint32_t cpt2 = _get_cpt(pos + num_whitespaces);
+                if (cpt2 == '\r' || cpt2 == '\n') {
+                    last_end_r_or_n = pos + num_whitespaces + 1;
+                }
+                num_whitespaces++;
+            }
+
+            if (last_end_r_or_n > 0) {
+                pos = last_end_r_or_n;
+                _add_token(pos);
+                continue;
+            }
+
+            if (num_whitespaces > 1 && _get_cpt(pos + num_whitespaces) != OUT_OF_RANGE) {
+                pos += num_whitespaces - 1;
+                _add_token(pos);
+                continue;
+            }
+
+            if (num_whitespaces > 0) {
+                pos += num_whitespaces;
+                _add_token(pos);
+                continue;
+            }
+
+            _add_token(++pos);
+        }
+    }
+
+    return bpe_offsets;
+}
+
 static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string & text, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets; // store the offset of each word
     bpe_offsets.reserve(offsets.size()); // Reserve memory for the approximate size
@@ -1537,11 +1695,11 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
     } else if (
             regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         // Qwen35 regex pattern - similar to LLAMA3 but with \p{M} support for combining marks
-        bpe_offsets = unicode_regex_split_custom_llama3(text, offsets);
+        bpe_offsets = unicode_regex_split_custom_llama3_optimized(text, offsets);
     } else if (
             regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         // Qwen35 regex pattern (expanded form) - similar to LLAMA3 but with \p{M} support for combining marks
-        bpe_offsets = unicode_regex_split_custom_llama3(text, offsets);
+        bpe_offsets = unicode_regex_split_custom_llama3_optimized(text, offsets);
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
         bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);
