@@ -191,12 +191,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
-llama_build(test-unicode-regex-perf.cpp)
-target_include_directories(test-unicode-regex-perf PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_build(test-bpe-merge-perf.cpp)
-target_include_directories(test-bpe-merge-perf PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_build(test-flat-hash-map-perf.cpp)
-target_include_directories(test-flat-hash-map-perf PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# llama_build(test-unicode-regex-perf.cpp)  # File does not exist
+# target_include_directories(test-unicode-regex-perf PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# llama_build(test-bpe-merge-perf.cpp)  # File does not exist
+# target_include_directories(test-bpe-merge-perf PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# llama_build(test-flat-hash-map-perf.cpp)  # File does not exist
+# target_include_directories(test-flat-hash-map-perf PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build(test-bpe-hash-map-perf.cpp)
 target_include_directories(test-bpe-hash-map-perf PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build(test-tokenize-overall-perf.cpp)

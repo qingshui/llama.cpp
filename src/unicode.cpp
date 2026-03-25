@@ -24,11 +24,148 @@
 
 namespace simdutf_utf8 {
 
-// Round 27: Optimized UTF-8 decoder based on simdutf library
-// Uses AVX2 for efficient batch processing of UTF-8 sequences
+// Round 29: Combined UTF-8 decoder and category lookup
+// Returns pair of (codepoints, flags) to avoid second lookup pass
+struct decode_utf8_with_flags_result {
+    std::vector<uint32_t> codepoints;
+    std::vector<::unicode_cpt_flags> flags;
+};
 
 #ifdef __AVX2__
 #include <immintrin.h>
+
+inline decode_utf8_with_flags_result decode_utf8_with_flags(const char* input, size_t length);
+
+inline decode_utf8_with_flags_result decode_utf8_with_flags(const char* input, size_t length) {
+    decode_utf8_with_flags_result result;
+    result.codepoints.resize(length);
+    result.flags.resize(length);
+
+    // Pre-compute flags array for direct lookup during decoding
+    static const auto cpt_flags = []() {
+        std::vector<::unicode_cpt_flags> flags(0x10000);  // BMP only for inline lookup
+        // Initialize ASCII range
+        for (uint32_t c = 0; c < 0x80; c++) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+                flags[c].is_letter = true;
+            }
+            if (c >= '0' && c <= '9') {
+                flags[c].is_number = true;
+            }
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                flags[c].is_whitespace = true;
+            }
+        }
+        return flags;
+    }();
+
+    size_t pos = 0;
+    size_t out_idx = 0;
+
+    // Process 16 bytes at a time using AVX2
+    while (pos + 15 <= length) {
+        // Load 16 bytes into AVX register
+        const __m128i vec = _mm_loadu_si128((const __m128i*)(input + pos));
+
+        // Check if all bytes are ASCII (high bit = 0)
+        const __m128i mask = _mm_set1_epi8(static_cast<char>(0x80));
+        const __m128i and_result = _mm_and_si128(vec, mask);
+        const int movemask = _mm_movemask_epi8(and_result);
+
+        if (movemask == 0) {
+            // All ASCII - use cvtepu8_epi32 to convert efficiently
+            __m256i ascii_vec = _mm256_cvtepu8_epi32(vec);
+            _mm256_storeu_si256((__m256i*)(result.codepoints.data() + out_idx), ascii_vec);
+
+            // Copy flags for 8 ASCII characters
+            for (int i = 0; i < 8; i++) {
+                uint8_t c = input[pos + i];
+                result.flags[out_idx + i] = cpt_flags[c];
+            }
+
+            out_idx += 8;
+            pos += 8;
+            continue;
+        }
+
+        // Not all ASCII - process byte by byte
+        break;
+    }
+
+    // Process remaining bytes
+    while (pos < length) {
+        unsigned char byte = input[pos];
+
+        // Fast path: ASCII
+        if (byte < 0x80) {
+            result.codepoints[out_idx] = byte;
+            result.flags[out_idx] = cpt_flags[byte];
+            out_idx++;
+            pos++;
+            continue;
+        }
+
+        // Decode UTF-8 sequence
+        if ((byte & 0b11100000) == 0b11000000) {
+            // 2-byte sequence
+            if (pos + 1 >= length || (input[pos + 1] & 0b11000000) != 0b10000000) {
+                result.codepoints[out_idx] = 0xFFFD;
+                out_idx++;
+                pos++;
+                continue;
+            }
+            uint32_t code_point = (byte & 0b00011111) << 6 | (input[pos + 1] & 0b00111111);
+            result.codepoints[out_idx] = code_point;
+            // Flags for non-ASCII will be looked up later if needed
+            out_idx++;
+            pos += 2;
+        } else if ((byte & 0b11110000) == 0b11100000) {
+            // 3-byte sequence (Chinese characters)
+            if (pos + 2 >= length ||
+                (input[pos + 1] & 0b11000000) != 0b10000000 ||
+                (input[pos + 2] & 0b11000000) != 0b10000000) {
+                result.codepoints[out_idx] = 0xFFFD;
+                out_idx++;
+                pos++;
+                continue;
+            }
+            uint32_t code_point = (byte & 0b00001111) << 12 |
+                                 (input[pos + 1] & 0b00111111) << 6 |
+                                 (input[pos + 2] & 0b00111111);
+            result.codepoints[out_idx] = code_point;
+            out_idx++;
+            pos += 3;
+        } else if ((byte & 0b11111000) == 0b11110000) {
+            // 4-byte sequence
+            if (pos + 3 >= length ||
+                (input[pos + 1] & 0b11000000) != 0b10000000 ||
+                (input[pos + 2] & 0b11000000) != 0b10000000 ||
+                (input[pos + 3] & 0b11000000) != 0b10000000) {
+                result.codepoints[out_idx] = 0xFFFD;
+                out_idx++;
+                pos++;
+                continue;
+            }
+            uint32_t code_point =
+                (byte & 0b00000111) << 18 |
+                (input[pos + 1] & 0b00111111) << 12 |
+                (input[pos + 2] & 0b00111111) << 6 |
+                (input[pos + 3] & 0b00111111);
+            result.codepoints[out_idx] = code_point;
+            out_idx++;
+            pos += 4;
+        } else {
+            // Invalid start byte
+            result.codepoints[out_idx] = 0xFFFD;
+            out_idx++;
+            pos++;
+        }
+    }
+
+    result.codepoints.resize(out_idx);
+    result.flags.resize(out_idx);
+    return result;
+}
 
 inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
     std::vector<uint32_t> result;
@@ -217,6 +354,99 @@ inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
     }
 
     result.resize(out_idx);  // Trim to actual size
+    return result;
+}
+
+// Fallback implementation of decode_utf8_with_flags without AVX2
+inline decode_utf8_with_flags_result decode_utf8_with_flags(const char* input, size_t length) {
+    decode_utf8_with_flags_result result;
+    result.codepoints.resize(length);
+    result.flags.resize(length);
+
+    // Pre-compute ASCII flags
+    static const auto cpt_flags = []() {
+        std::vector<::unicode_cpt_flags> flags(0x10000);
+        for (uint32_t c = 0; c < 0x80; c++) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+                flags[c].is_letter = true;
+            }
+            if (c >= '0' && c <= '9') {
+                flags[c].is_number = true;
+            }
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                flags[c].is_whitespace = true;
+            }
+        }
+        return flags;
+    }();
+
+    size_t pos = 0;
+    size_t out_idx = 0;
+
+    while (pos < length) {
+        unsigned char byte = input[pos];
+
+        if (byte < 0x80) {
+            result.codepoints[out_idx] = byte;
+            result.flags[out_idx] = cpt_flags[byte];
+            out_idx++;
+            pos++;
+            continue;
+        }
+
+        if ((byte & 0b11100000) == 0b11000000) {
+            if (pos + 1 >= length || (input[pos + 1] & 0b11000000) != 0b10000000) {
+                result.codepoints[out_idx] = 0xFFFD;
+                out_idx++;
+                pos++;
+                continue;
+            }
+            uint32_t code_point = (byte & 0b00011111) << 6 | (input[pos + 1] & 0b00111111);
+            result.codepoints[out_idx] = code_point;
+            out_idx++;
+            pos += 2;
+        } else if ((byte & 0b11110000) == 0b11100000) {
+            if (pos + 2 >= length ||
+                (input[pos + 1] & 0b11000000) != 0b10000000 ||
+                (input[pos + 2] & 0b11000000) != 0b10000000) {
+                result.codepoints[out_idx] = 0xFFFD;
+                out_idx++;
+                pos++;
+                continue;
+            }
+            uint32_t code_point = (byte & 0b00001111) << 12 |
+                                 (input[pos + 1] & 0b00111111) << 6 |
+                                 (input[pos + 2] & 0b00111111);
+            result.codepoints[out_idx] = code_point;
+            out_idx++;
+            pos += 3;
+        } else if ((byte & 0b11111000) == 0b11110000) {
+            if (pos + 3 >= length ||
+                (input[pos + 1] & 0b11000000) != 0b10000000 ||
+                (input[pos + 2] & 0b11000000) != 0b10000000 ||
+                (input[pos + 3] & 0b11000000) != 0b10000000) {
+                result.codepoints[out_idx] = 0xFFFD;
+                out_idx++;
+                pos++;
+                continue;
+            }
+            uint32_t code_point =
+                (byte & 0b00000111) << 18 |
+                (input[pos + 1] & 0b00111111) << 12 |
+                (input[pos + 2] & 0b00111111) << 6 |
+                (input[pos + 3] & 0b00111111);
+            result.codepoints[out_idx] = code_point;
+            out_idx++;
+            pos += 4;
+        } else {
+            result.codepoints[out_idx] = 0xFFFD;
+            out_idx++;
+            pos++;
+        }
+    }
+
+    result.codepoints.resize(out_idx);
+    result.flags.resize(out_idx);
     return result;
 }
 #endif
@@ -587,6 +817,146 @@ static inline bool is_whitespace_inline(uint32_t cpt) {
 
 // Round 23: Eliminate redundant boundary checks and optimize loop structure
 // Use sentinel value to avoid boundary checks in inner loops
+
+// Round 29: Optimized single-pass UTF-8 decode + category lookup
+// Combines UTF-8 decoding and Unicode category lookup in one pass
+static std::vector<size_t> unicode_regex_split_custom_gpt2_optimized(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size() * 4);
+
+    // Round 6: Ultra-fast pure ASCII path - skip UTF-8 decoding
+    if (is_pure_ascii(text.c_str(), text.size())) {
+        size_t start = 0;
+        for (auto offset : offsets) {
+            const size_t offset_end = start + offset;
+            auto fast_result = unicode_regex_split_ascii_gpt2(text.c_str() + start, offset);
+            for (size_t off : fast_result) {
+                bpe_offsets.push_back(off);
+            }
+            start = offset_end;
+        }
+        return bpe_offsets;
+    }
+
+    // Round 29: Single-pass decode with flags lookup
+    auto decoded = simdutf_utf8::decode_utf8_with_flags(text.c_str(), text.size());
+    const auto& cpts = decoded.codepoints;
+    const auto& flags = decoded.flags;
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t offset_ini = start;
+        const size_t offset_end = start + offset;
+        assert(offset_end <= cpts.size());
+        start = offset_end;
+
+        const uint32_t* pts = cpts.data();
+        const ::unicode_cpt_flags* f = flags.data();
+        const uint32_t* end_ptr = pts + offset_end;
+
+        const uint32_t* pos_ptr = pts + offset_ini;
+        const ::unicode_cpt_flags* flag_ptr = f + offset_ini;
+
+        while (pos_ptr < end_ptr) {
+            uint32_t cpt = *pos_ptr;
+
+            // regex: 's|'t|'re|'ve|'m|'ll|'d
+            if (cpt == '\'' && pos_ptr + 1 < end_ptr) {
+                uint32_t cpt_next = *(pos_ptr + 1);
+                if (cpt_next == 's' || cpt_next == 't' || cpt_next == 'm' || cpt_next == 'd') {
+                    bpe_offsets.push_back(2);
+                    pos_ptr += 2;
+                    flag_ptr += 2;
+                    continue;
+                }
+                if (pos_ptr + 2 < end_ptr) {
+                    uint32_t cpt_next_next = *(pos_ptr + 2);
+                    if ((cpt_next == 'r' && cpt_next_next == 'e') ||
+                        (cpt_next == 'v' && cpt_next_next == 'e') ||
+                        (cpt_next == 'l' && cpt_next_next == 'l')) {
+                        bpe_offsets.push_back(3);
+                        pos_ptr += 3;
+                        flag_ptr += 3;
+                        continue;
+                    }
+                }
+            }
+
+            // regex: <space>?\p{L}+
+            uint32_t cpt_check = (cpt == ' ') ? *(pos_ptr + 1) : cpt;
+            bool is_letter = (cpt_check < 0x80) ? ((cpt_check >= 'A' && cpt_check <= 'Z') || (cpt_check >= 'a' && cpt_check <= 'z')) : flag_ptr[0].is_letter;
+            if (is_letter) {
+                if (cpt == ' ') { pos_ptr++; flag_ptr++; }
+                while (pos_ptr < end_ptr) {
+                    uint32_t c = *pos_ptr;
+                    bool is_l = (c < 0x80) ? ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) : flag_ptr->is_letter;
+                    if (!is_l) break;
+                    pos_ptr++;
+                    flag_ptr++;
+                }
+                bpe_offsets.push_back(pos_ptr - (pts + offset_ini));
+                continue;
+            }
+
+            // regex: <space>?\p{N}+
+            cpt_check = (cpt == ' ') ? *(pos_ptr + 1) : cpt;
+            bool is_number = (cpt_check < 0x80) ? (cpt_check >= '0' && cpt_check <= '9') : flag_ptr[0].is_number;
+            if (is_number) {
+                if (cpt == ' ') { pos_ptr++; flag_ptr++; }
+                while (pos_ptr < end_ptr) {
+                    uint32_t c = *pos_ptr;
+                    bool is_n = (c < 0x80) ? (c >= '0' && c <= '9') : flag_ptr->is_number;
+                    if (!is_n) break;
+                    pos_ptr++;
+                    flag_ptr++;
+                }
+                bpe_offsets.push_back(pos_ptr - (pts + offset_ini));
+                continue;
+            }
+
+            // regex: <space>?[^\s\p{L}\p{N}]+
+            cpt_check = (cpt == ' ') ? *(pos_ptr + 1) : cpt;
+            bool is_ws = (cpt_check < 0x80) ? (cpt_check == ' ' || cpt_check == '\t' || cpt_check == '\n' || cpt_check == '\r') : flag_ptr[0].is_whitespace;
+            bool is_l = (cpt_check < 0x80) ? ((cpt_check >= 'A' && cpt_check <= 'Z') || (cpt_check >= 'a' && cpt_check <= 'z')) : flag_ptr[0].is_letter;
+            bool is_n = (cpt_check < 0x80) ? (cpt_check >= '0' && cpt_check <= '9') : flag_ptr[0].is_number;
+            if (!is_ws && !is_l && !is_n) {
+                if (cpt == ' ') { pos_ptr++; flag_ptr++; }
+                while (pos_ptr < end_ptr) {
+                    uint32_t c = *pos_ptr;
+                    bool is_w = (c < 0x80) ? (c == ' ' || c == '\t' || c == '\n' || c == '\r') : flag_ptr->is_whitespace;
+                    bool is_ll = (c < 0x80) ? ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) : flag_ptr->is_letter;
+                    bool is_nn = (c < 0x80) ? (c >= '0' && c <= '9') : flag_ptr->is_number;
+                    if (is_w || is_ll || is_nn) break;
+                    pos_ptr++;
+                    flag_ptr++;
+                }
+                bpe_offsets.push_back(pos_ptr - (pts + offset_ini));
+                continue;
+            }
+
+            // regex: \s+
+            const uint32_t* ws_start = pos_ptr;
+            while (pos_ptr < end_ptr) {
+                uint32_t c = *pos_ptr;
+                bool is_w = (c < 0x80) ? (c == ' ' || c == '\t' || c == '\n' || c == '\r') : flag_ptr->is_whitespace;
+                if (!is_w) break;
+                pos_ptr++;
+                flag_ptr++;
+            }
+            if (pos_ptr > ws_start) {
+                bpe_offsets.push_back(pos_ptr - (pts + offset_ini));
+                continue;
+            }
+
+            // no matches - consume single character
+            bpe_offsets.push_back(1);
+            pos_ptr++;
+            flag_ptr++;
+        }
+    }
+
+    return bpe_offsets;
+}
 
 static std::vector<size_t> unicode_regex_split_custom_gpt2(const std::string & text, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
@@ -1154,8 +1524,11 @@ static std::vector<size_t> unicode_regex_split_custom_afmoe(const std::string & 
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
+    // Round 29: Use optimized single-pass UTF-8 decode + category lookup for GPT2/Qwen35 patterns
+    // Note: Qwen35 uses LLAMA3-based patterns with \p{M} support, which are handled by unicode_regex_split_custom_llama3
+    // For now, we only optimize the pure GPT2 pattern
     if (regex_expr == "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)") {
-        bpe_offsets = unicode_regex_split_custom_gpt2(text, offsets);
+        bpe_offsets = unicode_regex_split_custom_gpt2_optimized(text, offsets);
     } else if (
             regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
             regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
