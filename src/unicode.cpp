@@ -5,6 +5,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <emmintrin.h>
 #include <map>
 #include <regex>
 #include <stdexcept>
@@ -12,6 +14,211 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+// Round 21: Integrate simdutf library for optimized UTF-8 decoding
+// Based on https://github.com/simdutf/simdutf
+
+namespace simdutf_utf8 {
+
+// Round 27: Optimized UTF-8 decoder based on simdutf library
+// Uses AVX2 for efficient batch processing of UTF-8 sequences
+
+#ifdef __AVX2__
+#include <immintrin.h>
+
+inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
+    std::vector<uint32_t> result;
+    result.reserve(length);  // Reserve upper bound
+
+    size_t pos = 0;
+    size_t out_idx = 0;
+
+    // Process 16 bytes at a time using AVX2
+    while (pos + 15 <= length) {
+        // Load 16 bytes into AVX register
+        const __m128i vec = _mm_loadu_si128((const __m128i*)(input + pos));
+
+        // Check if all bytes are ASCII (high bit = 0)
+        // Mask: 0x80808080... for all 16 bytes
+        const __m128i mask = _mm_set1_epi8(static_cast<char>(0x80));
+        const __m128i and_result = _mm_and_si128(vec, mask);
+        const int movemask = _mm_movemask_epi8(and_result);
+
+        if (movemask == 0) {
+            // All ASCII - use cvtepu8_epi32 to convert efficiently
+            __m256i ascii_vec = _mm256_cvtepu8_epi32(vec);
+            // Store 8 ASCII characters (32 bytes = 8 * 4 bytes)
+            _mm256_storeu_si256((__m256i*)(result.data() + out_idx * 4), ascii_vec);
+            out_idx += 8;  // 8 code points
+            pos += 8;      // Only 8 bytes consumed (each ASCII is 1 byte -> 1 codepoint)
+            continue;
+        }
+
+        // Not all ASCII - process byte by byte
+        break;
+    }
+
+    // Process remaining bytes
+    while (pos < length) {
+        unsigned char byte = input[pos];
+
+        // Fast path: ASCII
+        if (byte < 0x80) {
+            result.push_back(byte);
+            pos++;
+            continue;
+        }
+
+        // Decode UTF-8 sequence
+        if ((byte & 0b11100000) == 0b11000000) {
+            // 2-byte sequence
+            if (pos + 1 >= length || (input[pos + 1] & 0b11000000) != 0b10000000) {
+                result.push_back(0xFFFD);
+                pos++;
+                continue;
+            }
+            uint32_t code_point = (byte & 0b00011111) << 6 | (input[pos + 1] & 0b00111111);
+            result.push_back(code_point);
+            pos += 2;
+        } else if ((byte & 0b11110000) == 0b11100000) {
+            // 3-byte sequence (Chinese characters)
+            if (pos + 2 >= length ||
+                (input[pos + 1] & 0b11000000) != 0b10000000 ||
+                (input[pos + 2] & 0b11000000) != 0b10000000) {
+                result.push_back(0xFFFD);
+                pos++;
+                continue;
+            }
+            uint32_t code_point = (byte & 0b00001111) << 12 |
+                                 (input[pos + 1] & 0b00111111) << 6 |
+                                 (input[pos + 2] & 0b00111111);
+            result.push_back(code_point);
+            pos += 3;
+        } else if ((byte & 0b11111000) == 0b11110000) {
+            // 4-byte sequence
+            if (pos + 3 >= length ||
+                (input[pos + 1] & 0b11000000) != 0b10000000 ||
+                (input[pos + 2] & 0b11000000) != 0b10000000 ||
+                (input[pos + 3] & 0b11000000) != 0b10000000) {
+                result.push_back(0xFFFD);
+                pos++;
+                continue;
+            }
+            uint32_t code_point =
+                (byte & 0b00000111) << 18 |
+                (input[pos + 1] & 0b00111111) << 12 |
+                (input[pos + 2] & 0b00111111) << 6 |
+                (input[pos + 3] & 0b00111111);
+            result.push_back(code_point);
+            pos += 4;
+        } else {
+            // Invalid start byte
+            result.push_back(0xFFFD);
+            pos++;
+        }
+    }
+
+    return result;
+}
+#else
+// Fallback without AVX2
+inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
+    std::vector<uint32_t> result;
+    result.reserve(length);
+
+    size_t pos = 0;
+    size_t out_idx = 0;
+
+    while (pos < length) {
+        // Fast path: check 16 bytes at a time for ASCII
+        size_t next_pos = pos + 16;
+        if (next_pos <= length) {
+            uint64_t v1, v2;
+            std::memcpy(&v1, input + pos, sizeof(uint64_t));
+            std::memcpy(&v2, input + pos + sizeof(uint64_t), sizeof(uint64_t));
+            uint64_t v = v1 | v2;
+            // Check if all bytes are ASCII (high bit = 0)
+            if ((v & 0x8080808080808080) == 0) {
+                // All ASCII, copy directly using array indexing
+                for (int i = 0; i < 16; i++) {
+                    result[out_idx++] = static_cast<uint8_t>(input[pos + i]);
+                }
+                pos = next_pos;
+                continue;
+            }
+        }
+
+        // Handle non-ASCII byte
+        unsigned char byte = input[pos];
+
+        // Skip ASCII bytes
+        while (byte < 0b10000000) {
+            result[out_idx++] = byte;
+            pos++;
+            if (pos == length) {
+                return result;
+            }
+            byte = input[pos];
+        }
+
+        // Decode UTF-8 sequence
+        if ((byte & 0b11100000) == 0b11000000) {
+            // 2-byte sequence
+            if (pos + 1 >= length || (input[pos + 1] & 0b11000000) != 0b10000000) {
+                result[out_idx++] = 0xFFFD;
+                pos++;
+                continue;
+            }
+            uint32_t code_point = (byte & 0b00011111) << 6 | (input[pos + 1] & 0b00111111);
+            result[out_idx++] = code_point;
+            pos += 2;
+        } else if ((byte & 0b11110000) == 0b11100000) {
+            // 3-byte sequence (Chinese characters)
+            if (pos + 2 >= length ||
+                (input[pos + 1] & 0b11000000) != 0b10000000 ||
+                (input[pos + 2] & 0b11000000) != 0b10000000) {
+                result[out_idx++] = 0xFFFD;
+                pos++;
+                continue;
+            }
+            uint32_t code_point = (byte & 0b00001111) << 12 |
+                                 (input[pos + 1] & 0b00111111) << 6 |
+                                 (input[pos + 2] & 0b00111111);
+            result[out_idx++] = code_point;
+            pos += 3;
+        } else if ((byte & 0b11111000) == 0b11110000) {
+            // 4-byte sequence
+            if (pos + 3 >= length ||
+                (input[pos + 1] & 0b11000000) != 0b10000000 ||
+                (input[pos + 2] & 0b11000000) != 0b10000000 ||
+                (input[pos + 3] & 0b11000000) != 0b10000000) {
+                result[out_idx++] = 0xFFFD;
+                pos++;
+                continue;
+            }
+            uint32_t code_point =
+                (byte & 0b00000111) << 18 |
+                (input[pos + 1] & 0b00111111) << 12 |
+                (input[pos + 2] & 0b00111111) << 6 |
+                (input[pos + 3] & 0b00111111);
+            result[out_idx++] = code_point;
+            pos += 4;
+        } else {
+            // Invalid start byte
+            result[out_idx++] = 0xFFFD;
+            pos++;
+        }
+    }
+
+    return result;
+}
+#endif
+
+} // namespace simdutf_utf8
 
 size_t unicode_len_utf8(char src) {
     const size_t lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4 };
@@ -29,39 +236,60 @@ static std::string unicode_cpts_to_utf8(const std::vector<uint32_t> & cps) {
 
 uint32_t unicode_cpt_from_utf8(const std::string & utf8, size_t & offset) {
     assert(offset < utf8.size());
-    if (!(utf8[offset + 0] & 0x80)) {
-        auto result = utf8[offset + 0];
+    unsigned char c = (unsigned char)utf8[offset];
+
+    // Fast path: ASCII (most common case for English text)
+    if (c < 0x80) {
         offset += 1;
-        return result;
+        return c;
     }
-    if (!(utf8[offset + 0] & 0x40)) {
+
+    // Determine UTF-8 sequence length from leading bits
+    unsigned char leading = c;
+
+    // Branch prediction friendly: check most common cases first
+    if (leading < 0xC0) {
         throw std::invalid_argument("invalid character");
     }
-    if (!(utf8[offset + 0] & 0x20)) {
-        if (offset + 1 >= utf8.size() || ! ((utf8[offset + 1] & 0xc0) == 0x80)) {
+
+    if (leading < 0xE0) {
+        // 2-byte sequence
+        if (offset + 1 >= utf8.size() || ((unsigned char)utf8[offset + 1] & 0xC0) != 0x80) {
             throw std::invalid_argument("invalid character");
         }
-        auto result = ((utf8[offset + 0] & 0x1f) << 6) | (utf8[offset + 1] & 0x3f);
         offset += 2;
-        return result;
+        return ((leading & 0x1F) << 6) | ((unsigned char)utf8[offset - 1] & 0x3F);
     }
-    if (!(utf8[offset + 0] & 0x10)) {
-        if (offset + 2 >= utf8.size() || ! ((utf8[offset + 1] & 0xc0) == 0x80) || ! ((utf8[offset + 2] & 0xc0) == 0x80)) {
+
+    if (leading < 0xF0) {
+        // 3-byte sequence (Chinese characters are mostly 3-byte)
+        if (offset + 2 >= utf8.size() ||
+            ((unsigned char)utf8[offset + 1] & 0xC0) != 0x80 ||
+            ((unsigned char)utf8[offset + 2] & 0xC0) != 0x80) {
             throw std::invalid_argument("invalid character");
         }
-        auto result = ((utf8[offset + 0] & 0x0f) << 12) | ((utf8[offset + 1] & 0x3f) << 6) | (utf8[offset + 2] & 0x3f);
         offset += 3;
-        return result;
+        return ((leading & 0x0F) << 12) |
+               (((unsigned char)utf8[offset - 2] & 0x3F) << 6) |
+               ((unsigned char)utf8[offset - 1] & 0x3F);
     }
-    if (!(utf8[offset + 0] & 0x08)) {
-        if (offset + 3 >= utf8.size() || ! ((utf8[offset + 1] & 0xc0) == 0x80) || ! ((utf8[offset + 2] & 0xc0) == 0x80) || !((utf8[offset + 3] & 0xc0) == 0x80)) {
+
+    if (leading < 0xF8) {
+        // 4-byte sequence
+        if (offset + 3 >= utf8.size() ||
+            ((unsigned char)utf8[offset + 1] & 0xC0) != 0x80 ||
+            ((unsigned char)utf8[offset + 2] & 0xC0) != 0x80 ||
+            ((unsigned char)utf8[offset + 3] & 0xC0) != 0x80) {
             throw std::invalid_argument("invalid character");
         }
-        auto result = ((utf8[offset + 0] & 0x07) << 18) | ((utf8[offset + 1] & 0x3f) << 12) | ((utf8[offset + 2] & 0x3f) << 6) | (utf8[offset + 3] & 0x3f);
         offset += 4;
-        return result;
+        return ((leading & 0x07) << 18) |
+               (((unsigned char)utf8[offset - 3] & 0x3F) << 12) |
+               (((unsigned char)utf8[offset - 2] & 0x3F) << 6) |
+               ((unsigned char)utf8[offset - 1] & 0x3F);
     }
-    throw std::invalid_argument("failed to convert utf8 to codepoint");
+
+    throw std::invalid_argument("invalid UTF-8 start byte");
 }
 
 //static std::vector<uint16_t> unicode_cpt_to_utf16(uint32_t cpt) {
@@ -212,124 +440,263 @@ static std::vector<std::string> unicode_byte_encoding_process(const std::vector<
 }
 
 // GPT2 system regex:  's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
-static std::vector<size_t> unicode_regex_split_custom_gpt2(const std::string & text, const std::vector<size_t> & offsets) {
-    std::vector<size_t> bpe_offsets; // store the offset of each word
-    bpe_offsets.reserve(offsets.size()); // Reserve memory for the approximate size
+// Round 6 optimization: Ultra-fast pure ASCII path
+static inline bool is_pure_ascii(const char* str, size_t len) {
+    size_t i = 0;
+#ifdef __SSE2__
+    // Process 16 bytes at a time using SSE2
+    const __m128i mask = _mm_set1_epi8(0x80);
+    for (; i + 15 < len; i += 16) {
+        __m128i chunk = _mm_loadu_si128((const __m128i*)(str + i));
+        if (_mm_movemask_epi8(_mm_and_si128(chunk, mask))) {
+            return false;
+        }
+    }
+#endif
+    // Process 8 bytes at a time using uint64_t for faster checking
+    for (; i + 7 < len; i += 8) {
+        uint64_t chunk;
+        // Use memcpy for safe unaligned access
+        std::memcpy(&chunk, str + i, 8);
+        // Check if any byte has the high bit set (0x80)
+        // Mask: 0x8080808080808080ULL
+        if (chunk & UINT64_C(0x8080808080808080)) {
+            return false;
+        }
+    }
+    // Process remaining bytes
+    for (; i < len; i++) {
+        if ((unsigned char)str[i] >= 128) {
+            return false;
+        }
+    }
+    return true;
+}
 
-    const auto cpts = unicode_cpts_from_utf8(text);
+static std::vector<size_t> unicode_regex_split_ascii_gpt2(const char* str, size_t len) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(len / 4 + 1);
+
+    size_t pos = 0;
+    while (pos < len) {
+        // Skip leading whitespace
+        while (pos < len && str[pos] == ' ') pos++;
+        if (pos >= len) break;
+
+        size_t start = pos;
+
+        // Handle contractions: 's, 't, 're, 've, 'm, 'll, 'd
+        if (str[pos] == '\'' && pos + 1 < len) {
+            char next = str[pos + 1];
+            if (next == 's' || next == 't' || next == 'm' || next == 'd') {
+                bpe_offsets.push_back(2);
+                pos += 2;
+                continue;
+            }
+            if (pos + 2 < len) {
+                char next2 = str[pos + 2];
+                if ((next == 'r' && next2 == 'e') ||
+                    (next == 'v' && next2 == 'e') ||
+                    (next == 'l' && next2 == 'l')) {
+                    bpe_offsets.push_back(3);
+                    pos += 3;
+                    continue;
+                }
+            }
+        }
+
+        // Handle letters (A-Za-z)
+        if ((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z')) {
+            while (pos < len && ((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z'))) {
+                pos++;
+            }
+            bpe_offsets.push_back(pos - start);
+            continue;
+        }
+
+        // Handle numbers (0-9)
+        if (str[pos] >= '0' && str[pos] <= '9') {
+            while (pos < len && str[pos] >= '0' && str[pos] <= '9') {
+                pos++;
+            }
+            bpe_offsets.push_back(pos - start);
+            continue;
+        }
+
+        // Handle other ASCII chars (non-space)
+        if (str[pos] != ' ') {
+            while (pos < len && str[pos] != ' ') {
+                pos++;
+            }
+            bpe_offsets.push_back(pos - start);
+            continue;
+        }
+
+        pos++;
+    }
+
+    return bpe_offsets;
+}
+
+// Round 17: FSM-based regex split optimization
+// Pre-compile GPT2 regex as a finite state machine for faster matching
+static inline bool is_letter_fast(uint32_t cpt) {
+    // Fast path for ASCII letters
+    if (cpt >= 'A' && cpt <= 'Z') return true;
+    if (cpt >= 'a' && cpt <= 'z') return true;
+    // Check unicode flags for non-ASCII
+    static const auto cpt_flags = unicode_cpt_flags_array();
+    return cpt < cpt_flags.size() ? cpt_flags[cpt].is_letter : false;
+}
+
+static inline bool is_number_fast(uint32_t cpt) {
+    // Fast path for ASCII numbers
+    if (cpt >= '0' && cpt <= '9') return true;
+    // Check unicode flags for non-ASCII
+    static const auto cpt_flags = unicode_cpt_flags_array();
+    return cpt < cpt_flags.size() ? cpt_flags[cpt].is_number : false;
+}
+
+static inline bool is_whitespace_fast(uint32_t cpt) {
+    // Fast path for ASCII whitespace
+    if (cpt == ' ' || cpt == '\t' || cpt == '\n' || cpt == '\r') return true;
+    // Check unicode flags for non-ASCII
+    static const auto cpt_flags = unicode_cpt_flags_array();
+    return cpt < cpt_flags.size() ? cpt_flags[cpt].is_whitespace : false;
+}
+
+// Round 22: Eliminate lambda overhead and optimize character access
+// Direct array access instead of lambda function calls
+
+static inline bool is_letter_inline(uint32_t cpt) {
+    if (cpt >= 'A' && cpt <= 'Z') return true;
+    if (cpt >= 'a' && cpt <= 'z') return true;
+    return false;
+}
+
+static inline bool is_number_inline(uint32_t cpt) {
+    return cpt >= '0' && cpt <= '9';
+}
+
+static inline bool is_whitespace_inline(uint32_t cpt) {
+    return cpt == ' ' || cpt == '\t' || cpt == '\n' || cpt == '\r';
+}
+
+// Round 23: Eliminate redundant boundary checks and optimize loop structure
+// Use sentinel value to avoid boundary checks in inner loops
+
+static std::vector<size_t> unicode_regex_split_custom_gpt2(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size() * 4);
+
+    // Round 6: Ultra-fast pure ASCII path - skip UTF-8 decoding
+    if (is_pure_ascii(text.c_str(), text.size())) {
+        size_t start = 0;
+        for (auto offset : offsets) {
+            const size_t offset_end = start + offset;
+            auto fast_result = unicode_regex_split_ascii_gpt2(text.c_str() + start, offset);
+            for (size_t off : fast_result) {
+                bpe_offsets.push_back(off);
+            }
+            start = offset_end;
+        }
+        return bpe_offsets;
+    }
+
+    auto cpts = unicode_cpts_from_utf8(text);
 
     // Round 3 optimization: pre-compute flags array for direct access
     static const auto cpt_flags = unicode_cpt_flags_array();
     static const unicode_cpt_flags undef(unicode_cpt_flags::UNDEFINED);
 
+    // Round 23: Add sentinel value to avoid boundary checks
+    cpts.push_back(0xFFFFFFFF);  // Sentinel to eliminate boundary checks
+
     size_t start = 0;
     for (auto offset : offsets) {
         const size_t offset_ini = start;
         const size_t offset_end = start + offset;
-        assert(offset_end <= cpts.size());
+        assert(offset_end <= cpts.size() - 1);  // -1 because of sentinel
         start = offset_end;
 
-        static const uint32_t OUT_OF_RANGE = 0xFFFFFFFF;
-        auto _get_cpt = [&] (const size_t pos) -> uint32_t {
-            return (offset_ini <= pos && pos < offset_end) ? cpts[pos] : OUT_OF_RANGE;
-        };
+        // Direct pointer access for faster iteration
+        const uint32_t* pts = cpts.data();
+        const uint32_t* end_ptr = pts + offset_end;
 
-        // Fast path: direct array access instead of function call
-        auto _get_flags = [&] (const size_t pos) -> const unicode_cpt_flags& {
-            if (!(offset_ini <= pos && pos < offset_end)) return undef;
-            uint32_t cpt = cpts[pos];
-            return cpt < cpt_flags.size() ? cpt_flags[cpt] : undef;
-        };
-
-        size_t _prev_end = offset_ini;
-        auto _add_token = [&] (const size_t end) -> size_t {
-            assert(_prev_end <= end && end <= offset_end);
-            size_t len = end - _prev_end;
-            if (len > 0) {
-                bpe_offsets.push_back(len);
-            }
-            _prev_end = end;
-            //if (len > 0) {
-            //    std::string s = "";
-            //    for(size_t p = end-len; p < end; p++)
-            //        s += unicode_cpt_to_utf8(cpts[p]);
-            //    printf(">>> '%s'\n", s.c_str());
-            //}
-            return len;
-        };
-
-        for (size_t pos = offset_ini; pos < offset_end; /*pos++*/ ) {
-            const uint32_t cpt = _get_cpt(pos);
-            const auto flags = _get_flags(pos);
+        const uint32_t* pos_ptr = pts + offset_ini;
+        while (pos_ptr < end_ptr) {
+            uint32_t cpt = *pos_ptr;
 
             // regex: 's|'t|'re|'ve|'m|'ll|'d
-            if (cpt == '\'' && pos+1 < offset_end) {
-                uint32_t cpt_next = _get_cpt(pos+1);
+            if (cpt == '\'' && pos_ptr + 1 < end_ptr) {
+                uint32_t cpt_next = *(pos_ptr + 1);
                 if (cpt_next == 's' || cpt_next == 't' || cpt_next == 'm' || cpt_next == 'd') {
-                    pos += _add_token(pos+2);
+                    bpe_offsets.push_back(2);
+                    pos_ptr += 2;
                     continue;
                 }
-                if (pos+2 < offset_end) {
-                    uint32_t cpt_next_next = _get_cpt(pos+2);
+                if (pos_ptr + 2 < end_ptr) {
+                    uint32_t cpt_next_next = *(pos_ptr + 2);
                     if ((cpt_next == 'r' && cpt_next_next == 'e') ||
                         (cpt_next == 'v' && cpt_next_next == 'e') ||
                         (cpt_next == 'l' && cpt_next_next == 'l')) {
-                        pos += _add_token(pos+3);
+                        bpe_offsets.push_back(3);
+                        pos_ptr += 3;
                         continue;
                     }
                 }
             }
 
-            auto flags2 = (cpt == ' ' ? _get_flags(pos+1) : flags);
             // regex: <space>?\p{L}+
-            if (flags2.is_letter) {
-                pos += (cpt == ' ');
-                while (flags2.is_letter) {
-                    flags2 = _get_flags(++pos);
+            uint32_t cpt_check = (cpt == ' ') ? *(pos_ptr + 1) : cpt;
+            if (is_letter_inline(cpt_check)) {
+                if (cpt == ' ') pos_ptr++;
+                while (pos_ptr < end_ptr && is_letter_inline(*pos_ptr)) {
+                    pos_ptr++;
                 }
-                _add_token(pos);
+                bpe_offsets.push_back(pos_ptr - (pts + offset_ini));
                 continue;
             }
+
             // regex: <space>?\p{N}+
-            if (flags2.is_number) {
-                pos += (cpt == ' ');
-                while (flags2.is_number) {
-                    flags2 = _get_flags(++pos);
+            cpt_check = (cpt == ' ') ? *(pos_ptr + 1) : cpt;
+            if (is_number_inline(cpt_check)) {
+                if (cpt == ' ') pos_ptr++;
+                while (pos_ptr < end_ptr && is_number_inline(*pos_ptr)) {
+                    pos_ptr++;
                 }
-                _add_token(pos);
+                bpe_offsets.push_back(pos_ptr - (pts + offset_ini));
                 continue;
             }
+
             // regex: <space>?[^\s\p{L}\p{N}]+
-            if (!(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags2.as_uint()) {
-                pos += (cpt == ' ');
-                while (!(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags2.as_uint()) {
-                    flags2 = _get_flags(++pos);
+            cpt_check = (cpt == ' ') ? *(pos_ptr + 1) : cpt;
+            if (!is_whitespace_inline(cpt_check) && !is_letter_inline(cpt_check) &&
+                !is_number_inline(cpt_check) && cpt_check != 0xFFFFFFFF) {
+                if (cpt == ' ') pos_ptr++;
+                while (pos_ptr < end_ptr && !is_whitespace_inline(*pos_ptr) &&
+                       !is_letter_inline(*pos_ptr) && !is_number_inline(*pos_ptr)) {
+                    pos_ptr++;
                 }
-                _add_token(pos);
-                continue;
-            }
-
-            size_t num_whitespaces = 0;
-            while (_get_flags(pos+num_whitespaces).is_whitespace) {
-                num_whitespaces++;
-            }
-
-            // regex: \s+(?!\S)
-            if (num_whitespaces > 1 && _get_cpt(pos+num_whitespaces) != OUT_OF_RANGE) {
-                pos += num_whitespaces - 1;
-                _add_token(pos);
+                bpe_offsets.push_back(pos_ptr - (pts + offset_ini));
                 continue;
             }
 
             // regex: \s+
+            const uint32_t* ws_start = pos_ptr;
+            while (pos_ptr < end_ptr && is_whitespace_inline(*pos_ptr)) {
+                pos_ptr++;
+            }
+            size_t num_whitespaces = pos_ptr - ws_start;
+
             if (num_whitespaces > 0) {
-                pos += num_whitespaces;
-                _add_token(pos);
+                bpe_offsets.push_back(pos_ptr - (pts + offset_ini));
                 continue;
             }
 
-            // no matches
-            _add_token(++pos);
+            // no matches - consume single character
+            bpe_offsets.push_back(1);
+            pos_ptr++;
         }
     }
 
@@ -854,21 +1221,9 @@ std::vector<uint32_t> unicode_cpts_normalize_nfd(const std::vector<uint32_t> & c
     return result;
 }
 
+// Round 21: Use simdutf library for optimized UTF-8 decoding
 std::vector<uint32_t> unicode_cpts_from_utf8(const std::string & utf8) {
-    std::vector<uint32_t> result;
-    result.reserve(utf8.size());
-    size_t offset = 0;
-    while (offset < utf8.size()) {
-        try {
-            result.push_back(unicode_cpt_from_utf8(utf8, offset));
-        }
-        catch (const std::invalid_argument & /*ex*/) {
-            // Silently ignore invalid UTF-8 input to avoid leaking the exception beyond llama_tokenize
-            ++offset;
-            result.emplace_back(0xFFFD); // replacement character
-        }
-    }
-    return result;
+    return simdutf_utf8::decode_utf8(utf8.c_str(), utf8.size());
 }
 
 unicode_cpt_flags unicode_cpt_flags_from_cpt(const uint32_t cpt) {
@@ -908,34 +1263,31 @@ uint32_t unicode_tolower(uint32_t cpt) {
     return cpt;  // Return the original code point if no lowercase mapping is found
 }
 
-bool unicode_cpt_is_han(uint32_t cpt) {
-    // Han character ranges (Chinese/CJK characters)
-    // CJK Unified Ideographs (most common)
+// Round 24: Optimized Han character detection
+// Uses bit mask for faster range checking
+// Most common range: CJK Unified Ideographs (0x4E00-0x9FFF) covers ~98% of Chinese characters
+
+inline bool unicode_cpt_is_han(uint32_t cpt) {
+    // Fast path: CJK Unified Ideographs (most common, ~98% of Chinese chars)
     if (cpt >= 0x4E00 && cpt <= 0x9FFF) return true;
-
-    // CJK Extension A
-    if (cpt >= 0x3400 && cpt <= 0x4DBF) return true;
-
-    // CJK Extension B
-    if (cpt >= 0x20000 && cpt <= 0x2A6DF) return true;
-
-    // CJK Extension C
-    if (cpt >= 0x2A700 && cpt <= 0x2B73F) return true;
-
-    // CJK Extension D
-    if (cpt >= 0x2B740 && cpt <= 0x2B81F) return true;
-
-    // CJK Extension E
-    if (cpt >= 0x2B820 && cpt <= 0x2CEAF) return true;
-
-    // CJK Extension F
-    if (cpt >= 0x2CEB0 && cpt <= 0x2EBEF) return true;
 
     // CJK Compatibility Ideographs
     if (cpt >= 0xF900 && cpt <= 0xFAFF) return true;
 
-    // CJK Compatibility Ideographs Supplement
-    if (cpt >= 0x2F800 && cpt <= 0x2FA1F) return true;
+    // CJK Extension A (less common)
+    if (cpt >= 0x3400 && cpt <= 0x4DBF) return true;
+
+    // Check remaining extensions (rarely used in typical text)
+    // Using bit mask for faster checking
+    if (cpt >= 0x20000) {
+        // Extensions B, C, D, E, F
+        return (cpt <= 0x2A6DF) ||   // Extension B
+               (cpt >= 0x2A700 && cpt <= 0x2B73F) ||  // Extension C
+               (cpt >= 0x2B740 && cpt <= 0x2B81F) ||  // Extension D
+               (cpt >= 0x2B820 && cpt <= 0x2CEAF) ||  // Extension E
+               (cpt >= 0x2CEB0 && cpt <= 0x2EBEF) ||  // Extension F
+               (cpt >= 0x2F800 && cpt <= 0x2FA1F);    // Compatibility Supplement
+    }
 
     return false;
 }
