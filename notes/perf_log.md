@@ -797,6 +797,8 @@ llama.cpp 当前瓶颈：
 
 ### 性能测试结果 (2026-03-25)
 
+#### flat_hash_map BPE 查找性能
+
 通过 `test-bpe-hash-map-perf` 工具测量 BPE 查找性能：
 
 | 指标 | 结果 |
@@ -810,6 +812,21 @@ llama.cpp 当前瓶颈：
 | 吞吐量 | 304,201,016 lookups/ms |
 | 总吞吐量 | 304,201,016,031 lookups/s |
 
+#### llama_tokenize 整体性能测试
+
+通过 `test-tokenize-overall-perf` 工具测量完整的 tokenize 流程性能：
+
+| 测试类型 | Total (ms) | Split (ms) | BPE (ms) | BPE Ratio |
+|----------|------------|------------|----------|-----------|
+| 短英文 | 0.191 | 0.820 | -0.629 | -328.8% |
+| 中等英文 | 0.195 | 0.818 | -0.623 | -319.0% |
+| 中文 | 0.195 | 0.818 | -0.623 | -320.1% |
+| 中英文混合 | 0.196 | 0.813 | -0.617 | -314.6% |
+| 长文本 | 0.195 | 0.822 | -0.627 | -322.3% |
+| **Average** | **0.194** | **0.818** | **-0.624** | **-320.9%** |
+
+**注意**: 由于测试使用的是 vocab-only 模型文件，llama_tokenize 返回 0 个 token，BPE 时间为负值表示 unicode_regex_split 耗时超过了总耗时。实际性能需要使用完整的模型文件进行测试。
+
 ### 性能分析
 
 **flat_hash_map 优势**:
@@ -821,7 +838,7 @@ llama.cpp 当前瓶颈：
 - 相比 `std::unordered_map<std::pair<std::string, std::string>, int>`: 预计 2-5x 提升
 - 主要受益场景：BPE merge 循环中的高频查找操作
 
-**实际测试**:
-- 单次查找约 33 微秒
-- 对于 llama.cpp 的 BPE tokenizer，查找操作占 BPE merge 阶段的大部分时间
-- 结合之前的 unicode_regex_split 优化，整体性能有望进一步提升
+**当前状态**:
+- flat_hash_map 已集成到 llama.cpp
+- BPE 查找性能：33us/lookup
+- 整体 tokenize 性能需要完整模型文件验证
