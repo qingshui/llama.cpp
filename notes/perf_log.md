@@ -744,13 +744,35 @@
 - ✓ 正则匹配正确性 - tokenizer 可以正常分词
 - ✓ BPE merge 正确性 - 模型可以正常推理
 
-## Round 28: 优化 - 使用 flat_hash_map 替代 unordered_map
+## Round 28: 优化 - 使用 flat_hash_map 替代 unordered_map (已完成)
 
 ### 优化内容
 - 使用 `absl::flat_hash_map` 替代 `std::unordered_map`
 - 减少内存分配开销
 - 提高缓存局部性
 - 优化 find_bpe_rank 使用 string_view 直接查找
+
+### 集成方式
+1. **abseil-cpp 作为第三方依赖**
+   - 添加到 `third_party/abseil` 目录（通过 symlink 链接到 `/home/disk4/humingqing/work/abseil`）
+   - 在 CMakeLists.txt 中启用 `ABSL_BUILD_MONOLITHIC_SHARED_LIBS=ON`
+   - 链接 `absl::base` 库以支持 flat_hash_map 运行时
+
+2. **修改的文件**
+   - `CMakeLists.txt`: 添加 abseil subdirectory 和 include 路径
+   - `src/CMakeLists.txt`: 链接 `absl::base` 库
+   - `src/llama-vocab.cpp`: 使用 flat_hash_map，include 路径改为 `../third_party/abseil/absl/container/flat_hash_map.h`
+
+3. **数据结构变更**
+   ```cpp
+   // 之前
+   std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
+   std::unordered_map<std::string, llama_token> token_to_id;
+
+   // 现在
+   absl::flat_hash_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
+   absl::flat_hash_map<std::string, llama_token> token_to_id;
+   ```
 
 ### 预期效果
 - **保守估计**: 1.2-1.5 倍提升
@@ -766,3 +788,9 @@ llama.cpp 当前瓶颈：
 1. **bpe_ranks 使用 `std::unordered_map<std::pair<std::string, std::string>, int>`**
 2. **find_bpe_rank 需要创建临时字符串** - 虽然接收 string_view，但仍需转换
 3. **Unicode 类别查询** - `\p{L}`, `\p{N}` 等需要查询 cpt_flags 数组
+
+### 构建结果
+- ✓ CMake 配置成功 - "Using abseil-cpp from third_party directory"
+- ✓ llama 库编译成功
+- ✓ llama-cli 编译成功
+- ✓ abseil 动态库已生成：`libabseil_dll.so`, `libabsl_*.so`

@@ -185,9 +185,11 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
-# Add abseil-cpp as a third-party dependency
+# Add abseil-cpp as a CMake subdirectory with monolithic shared lib
 if (NOT TARGET absl::base)
     message(STATUS "Using abseil-cpp from third_party directory")
+    set(ABSL_PROPAGATE_CXX_STD ON)
+    set(ABSL_BUILD_MONOLITHIC_SHARED_LIBS ON)
     add_subdirectory(third_party/abseil)
 endif()
 
