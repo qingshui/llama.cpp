@@ -1633,7 +1633,7 @@ struct llama_vocab::impl {
     bool escape_whitespaces         = true;
     bool treat_whitespace_as_suffix = false;
 
-    std::unordered_map<std::string, llama_token> token_to_id;
+    absl::flat_hash_map<std::string, llama_token> token_to_id;
     std::vector<token_data>                      id_to_token;
 
     std::vector<llama_token> cache_special_tokens;

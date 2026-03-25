@@ -32,7 +32,7 @@ namespace simdutf_utf8 {
 
 inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
     std::vector<uint32_t> result;
-    result.reserve(length);  // Reserve upper bound
+    result.resize(length);  // Resize, not just reserve - we need actual elements
 
     size_t pos = 0;
     size_t out_idx = 0;
@@ -52,7 +52,7 @@ inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
             // All ASCII - use cvtepu8_epi32 to convert efficiently
             __m256i ascii_vec = _mm256_cvtepu8_epi32(vec);
             // Store 8 ASCII characters (32 bytes = 8 * 4 bytes)
-            _mm256_storeu_si256((__m256i*)(result.data() + out_idx * 4), ascii_vec);
+            _mm256_storeu_si256((__m256i*)(result.data() + out_idx), ascii_vec);
             out_idx += 8;  // 8 code points
             pos += 8;      // Only 8 bytes consumed (each ASCII is 1 byte -> 1 codepoint)
             continue;
@@ -68,7 +68,7 @@ inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
 
         // Fast path: ASCII
         if (byte < 0x80) {
-            result.push_back(byte);
+            result[out_idx++] = byte;
             pos++;
             continue;
         }
@@ -77,26 +77,26 @@ inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
         if ((byte & 0b11100000) == 0b11000000) {
             // 2-byte sequence
             if (pos + 1 >= length || (input[pos + 1] & 0b11000000) != 0b10000000) {
-                result.push_back(0xFFFD);
+                result[out_idx++] = 0xFFFD;
                 pos++;
                 continue;
             }
             uint32_t code_point = (byte & 0b00011111) << 6 | (input[pos + 1] & 0b00111111);
-            result.push_back(code_point);
+            result[out_idx++] = code_point;
             pos += 2;
         } else if ((byte & 0b11110000) == 0b11100000) {
             // 3-byte sequence (Chinese characters)
             if (pos + 2 >= length ||
                 (input[pos + 1] & 0b11000000) != 0b10000000 ||
                 (input[pos + 2] & 0b11000000) != 0b10000000) {
-                result.push_back(0xFFFD);
+                result[out_idx++] = 0xFFFD;
                 pos++;
                 continue;
             }
             uint32_t code_point = (byte & 0b00001111) << 12 |
                                  (input[pos + 1] & 0b00111111) << 6 |
                                  (input[pos + 2] & 0b00111111);
-            result.push_back(code_point);
+            result[out_idx++] = code_point;
             pos += 3;
         } else if ((byte & 0b11111000) == 0b11110000) {
             // 4-byte sequence
@@ -104,7 +104,7 @@ inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
                 (input[pos + 1] & 0b11000000) != 0b10000000 ||
                 (input[pos + 2] & 0b11000000) != 0b10000000 ||
                 (input[pos + 3] & 0b11000000) != 0b10000000) {
-                result.push_back(0xFFFD);
+                result[out_idx++] = 0xFFFD;
                 pos++;
                 continue;
             }
@@ -113,22 +113,23 @@ inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
                 (input[pos + 1] & 0b00111111) << 12 |
                 (input[pos + 2] & 0b00111111) << 6 |
                 (input[pos + 3] & 0b00111111);
-            result.push_back(code_point);
+            result[out_idx++] = code_point;
             pos += 4;
         } else {
             // Invalid start byte
-            result.push_back(0xFFFD);
+            result[out_idx++] = 0xFFFD;
             pos++;
         }
     }
 
+    result.resize(out_idx);  // Trim to actual size
     return result;
 }
 #else
 // Fallback without AVX2
 inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
     std::vector<uint32_t> result;
-    result.reserve(length);
+    result.resize(length);  // Resize, not just reserve - we need actual elements
 
     size_t pos = 0;
     size_t out_idx = 0;
@@ -160,6 +161,7 @@ inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
             result[out_idx++] = byte;
             pos++;
             if (pos == length) {
+                result.resize(out_idx);
                 return result;
             }
             byte = input[pos];
@@ -214,6 +216,7 @@ inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
         }
     }
 
+    result.resize(out_idx);  // Trim to actual size
     return result;
 }
 #endif
@@ -1157,6 +1160,14 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
             regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
             regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
 
+        bpe_offsets = unicode_regex_split_custom_llama3(text, offsets);
+    } else if (
+            regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        // Qwen35 regex pattern - similar to LLAMA3 but with \p{M} support for combining marks
+        bpe_offsets = unicode_regex_split_custom_llama3(text, offsets);
+    } else if (
+            regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        // Qwen35 regex pattern (expanded form) - similar to LLAMA3 but with \p{M} support for combining marks
         bpe_offsets = unicode_regex_split_custom_llama3(text, offsets);
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
