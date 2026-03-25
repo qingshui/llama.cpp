@@ -358,10 +358,17 @@ inline std::vector<uint32_t> decode_utf8(const char* input, size_t length) {
 }
 
 // Fallback implementation of decode_utf8_with_flags without AVX2
+// Round 32: Optimized memory allocation - use reserve instead of resize
 inline decode_utf8_with_flags_result decode_utf8_with_flags(const char* input, size_t length) {
     decode_utf8_with_flags_result result;
-    result.codepoints.resize(length);
-    result.flags.resize(length);
+    // Round 32: Estimate codepoint count more accurately
+    // Average UTF-8 sequence length is ~2.4 bytes for mixed text
+    // Reserve ~42% of length as initial capacity
+    size_t estimated_cpts = length * 42 / 100;
+    if (estimated_cpts < length / 4) estimated_cpts = length / 4;
+    if (estimated_cpts > length) estimated_cpts = length;
+    result.codepoints.reserve(estimated_cpts);
+    result.flags.reserve(estimated_cpts);
 
     // Pre-compute ASCII flags
     static const auto cpt_flags = []() {
@@ -381,52 +388,50 @@ inline decode_utf8_with_flags_result decode_utf8_with_flags(const char* input, s
     }();
 
     size_t pos = 0;
-    size_t out_idx = 0;
 
     while (pos < length) {
         unsigned char byte = input[pos];
 
         if (byte < 0x80) {
-            result.codepoints[out_idx] = byte;
-            result.flags[out_idx] = cpt_flags[byte];
-            out_idx++;
+            result.codepoints.push_back(byte);
+            result.flags.push_back(cpt_flags[byte]);
             pos++;
             continue;
         }
 
         if ((byte & 0b11100000) == 0b11000000) {
             if (pos + 1 >= length || (input[pos + 1] & 0b11000000) != 0b10000000) {
-                result.codepoints[out_idx] = 0xFFFD;
-                out_idx++;
+                result.codepoints.push_back(0xFFFD);
+                result.flags.push_back(cpt_flags[0xFFFD]);
                 pos++;
                 continue;
             }
             uint32_t code_point = (byte & 0b00011111) << 6 | (input[pos + 1] & 0b00111111);
-            result.codepoints[out_idx] = code_point;
-            out_idx++;
+            result.codepoints.push_back(code_point);
+            result.flags.push_back(unicode_cpt_flags_from_cpt(code_point));
             pos += 2;
         } else if ((byte & 0b11110000) == 0b11100000) {
             if (pos + 2 >= length ||
                 (input[pos + 1] & 0b11000000) != 0b10000000 ||
                 (input[pos + 2] & 0b11000000) != 0b10000000) {
-                result.codepoints[out_idx] = 0xFFFD;
-                out_idx++;
+                result.codepoints.push_back(0xFFFD);
+                result.flags.push_back(cpt_flags[0xFFFD]);
                 pos++;
                 continue;
             }
             uint32_t code_point = (byte & 0b00001111) << 12 |
                                  (input[pos + 1] & 0b00111111) << 6 |
                                  (input[pos + 2] & 0b00111111);
-            result.codepoints[out_idx] = code_point;
-            out_idx++;
+            result.codepoints.push_back(code_point);
+            result.flags.push_back(unicode_cpt_flags_from_cpt(code_point));
             pos += 3;
         } else if ((byte & 0b11111000) == 0b11110000) {
             if (pos + 3 >= length ||
                 (input[pos + 1] & 0b11000000) != 0b10000000 ||
                 (input[pos + 2] & 0b11000000) != 0b10000000 ||
                 (input[pos + 3] & 0b11000000) != 0b10000000) {
-                result.codepoints[out_idx] = 0xFFFD;
-                out_idx++;
+                result.codepoints.push_back(0xFFFD);
+                result.flags.push_back(cpt_flags[0xFFFD]);
                 pos++;
                 continue;
             }
@@ -435,18 +440,16 @@ inline decode_utf8_with_flags_result decode_utf8_with_flags(const char* input, s
                 (input[pos + 1] & 0b00111111) << 12 |
                 (input[pos + 2] & 0b00111111) << 6 |
                 (input[pos + 3] & 0b00111111);
-            result.codepoints[out_idx] = code_point;
-            out_idx++;
+            result.codepoints.push_back(code_point);
+            result.flags.push_back(unicode_cpt_flags_from_cpt(code_point));
             pos += 4;
         } else {
-            result.codepoints[out_idx] = 0xFFFD;
-            out_idx++;
+            result.codepoints.push_back(0xFFFD);
+            result.flags.push_back(cpt_flags[0xFFFD]);
             pos++;
         }
     }
 
-    result.codepoints.resize(out_idx);
-    result.flags.resize(out_idx);
     return result;
 }
 #endif
