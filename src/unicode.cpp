@@ -804,7 +804,7 @@ static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string &
             auto flags2 = (cpt == ' ' ? _get_flags(pos+1) : flags);
             if (!(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags.as_uint()) {
                 pos += (cpt == ' ');
-                while (!(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags2.as_uint()) {
+                while (pos < offset_end && !(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags2.as_uint()) {
                     flags2 = _get_flags(++pos);
                 }
                 uint32_t cpt2 = _get_cpt(pos);
