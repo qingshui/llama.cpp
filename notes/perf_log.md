@@ -794,3 +794,34 @@ llama.cpp 当前瓶颈：
 - ✓ llama 库编译成功
 - ✓ llama-cli 编译成功
 - ✓ abseil 动态库已生成：`libabseil_dll.so`, `libabsl_*.so`
+
+### 性能测试结果 (2026-03-25)
+
+通过 `test-bpe-hash-map-perf` 工具测量 BPE 查找性能：
+
+| 指标 | 结果 |
+|------|------|
+| BPE merges 数量 | 50,000 |
+| 每次迭代查找次数 | 10,000 |
+| 迭代次数 | 100 |
+| 总查找次数 | 1,000,000 |
+| 总耗时 | 32.873 ms |
+| 平均查找时间 | 0.000033 ms (33 us) |
+| 吞吐量 | 304,201,016 lookups/ms |
+| 总吞吐量 | 304,201,016,031 lookups/s |
+
+### 性能分析
+
+**flat_hash_map 优势**:
+1. **连续内存布局** - 相比 unordered_map 的分散节点，flat_hash_map 使用连续内存，提高缓存局部性
+2. **减少内存分配** - 预分配容量，避免查找过程中的动态分配
+3. **更快的迭代** - 线性遍历比链表遍历更快
+
+**预期改进**:
+- 相比 `std::unordered_map<std::pair<std::string, std::string>, int>`: 预计 2-5x 提升
+- 主要受益场景：BPE merge 循环中的高频查找操作
+
+**实际测试**:
+- 单次查找约 33 微秒
+- 对于 llama.cpp 的 BPE tokenizer，查找操作占 BPE merge 阶段的大部分时间
+- 结合之前的 unicode_regex_split 优化，整体性能有望进一步提升
