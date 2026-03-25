@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
+cmake_minimum_required(VERSION 3.16...3.28) # for add_link_options and implicit target directories.
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
@@ -183,6 +183,12 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
+endif()
+
+# Add abseil-cpp as a third-party dependency
+if (NOT TARGET absl::base)
+    message(STATUS "Using abseil-cpp from third_party directory")
+    add_subdirectory(third_party/abseil)
 endif()
 
 #

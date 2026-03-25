@@ -23,6 +23,9 @@
 #include <string_view>
 #include <unordered_map>
 
+// Round 28: Use absl::flat_hash_map for better performance
+#include "../third_party/abseil/absl/container/flat_hash_map.h"
+
 //
 // helpers
 //
@@ -1282,8 +1285,9 @@ struct llm_tokenizer_plamo2 : llm_tokenizer {
         table_.clear();
 
         // Build token list and byte mapping
-        std::unordered_map<std::string, float> suffix_to_score;
-        std::unordered_map<std::string, llama_token> token_to_id;
+        // Round 28: Use flat_hash_map for better performance
+        absl::flat_hash_map<std::string, float> suffix_to_score;
+        absl::flat_hash_map<std::string, llama_token> token_to_id;
 
         for (size_t token_id = 0; token_id < vocab.n_tokens(); ++token_id) {
             const auto & entry = vocab.get_token_data(token_id);
@@ -1635,7 +1639,7 @@ struct llama_vocab::impl {
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
 
-    // Hash helper for string_view pairs
+    // Round 28: Hash helper for flat_hash_map with string_view pairs
     struct pair_hash {
         size_t operator()(const std::pair<std::string, std::string>& p) const {
             // Use a better hash combining function
@@ -1648,7 +1652,8 @@ struct llama_vocab::impl {
         }
     };
 
-    std::unordered_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
+    // Round 28: Use flat_hash_map for better cache locality and performance
+    absl::flat_hash_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
 
     // Round 4: Chinese character fast path LUT
     // CJK Unified Ideographs range: 0x4E00 - 0x9FFF (20941 characters)
@@ -1663,7 +1668,7 @@ struct llama_vocab::impl {
     struct {
         std::vector<std::string> keys;      // LRU order (front = most recent)
         std::vector<llama_token> values;
-        size_t capacity = 128;              // Small capacity for L1 cache locality
+        size_t capacity = 1024;             // Increased capacity for better hit rate
     } token_cache;
 
     // Round 7: Combining mark cache for Qwen3.5
@@ -2229,7 +2234,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
         han_cache.initialized = true;
 
         // Initialize token cache with default capacity
-        token_cache.capacity = 128;
+        token_cache.capacity = 1024;  // Round 5: Increased capacity for better hit rate
         token_cache.keys.reserve(128);
         token_cache.values.reserve(128);
 
