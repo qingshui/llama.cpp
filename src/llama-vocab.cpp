@@ -3838,11 +3838,7 @@ int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view tok
     GGML_ASSERT(token_right.find('\n') == std::string_view::npos);
 
     // Round 31: Optimized lookup - create strings only for final comparison
-    // Most lookups are misses, so we use a hash-based pre-filter
     auto& bpe_ranks = pimpl->bpe_ranks;
-
-    // Direct lookup - abseil's flat_hash_map is already optimized
-    // The string creation is unavoidable for the final comparison
     auto it = bpe_ranks.find(std::make_pair(std::string(token_left), std::string(token_right)));
     if (it == bpe_ranks.end()) {
         return -1;
