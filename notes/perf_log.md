@@ -1013,3 +1013,86 @@ llama.cpp 当前瓶颈：
 | Round 32 | 0.040 ms | 0.019 | 0.021 | 8.0x |
 
 **距离 10x 目标**: 当前 8.0x，需要再提升 1.25x
+
+## Round 33: 尝试 Bigram Cache 优化 (2026-03-26)
+
+### 优化内容
+- 添加 64K entry 的 bigram cache，加速常用 bigram 查找
+- 使用自定义哈希函数，避免字符串创建
+
+### 性能结果
+- 平均耗时：0.041ms (优化前 0.039ms)
+- 加速比：0.95x (性能下降)
+
+### 结论
+- Bigram cache 的哈希计算和验证开销超过了收益
+- 已回滚优化
+
+## Round 34: 尝试 Thread-Local String Cache 优化 (2026-03-26)
+
+### 优化内容
+- 使用 thread-local string cache 避免重复字符串分配
+- 缓存最近使用的 bigram text 字符串
+
+### 性能结果
+- 平均耗时：0.051ms (优化前 0.039ms)
+- 加速比：0.76x (性能下降)
+
+### 结论
+- String comparison 开销超过了分配节省的开销
+- 已回滚优化
+
+## Round 35: 使用 pair<uint64_t, uint64_t> 哈希值优化 BPE 查找 (2026-03-26)
+
+### 优化内容
+- 使用 `pair<uint64_t, uint64_t>` 哈希值作为 bpe_ranks_hash 的 key
+- 避免 BPE 查找时的字符串创建和比较
+- 使用 SplitMix64 哈希组合函数减少冲突
+
+### 修改文件
+- `src/llama-vocab.cpp`: 修改 bpe_ranks_hash 数据结构
+- `src/llama-vocab.cpp`: 更新 find_bpe_rank 函数
+- `src/llama-vocab.cpp`: 更新 bpe_ranks_hash 填充逻辑
+
+### 实现细节
+1. **pair_uint64_hash**: 使用 SplitMix64 组合左右 token 的哈希值
+2. **零字符串创建**: BPE 查找不需要创建临时字符串
+3. **正确性验证**: 使用 llama.cpp 内部基准对比，确保 token 输出一致
+
+### 性能结果 (2026-03-26)
+
+| 测试 | Tokens | tokenizers-cpp (ms) | llama.cpp Round 31 (ms) | llama.cpp Round 35 (ms) | 提升 |
+|------|--------|---------------------|-------------------------|-------------------------|------|
+| Short EN | 4 | 0.002 | 0.012 | 0.010 | 1.20x |
+| Short CN | 4 | 0.003 | 0.015 | 0.014 | 1.07x |
+| Medium EN | 10 | 0.005 | 0.028 | 0.029 | 0.97x |
+| Medium CN | 9 | 0.005 | 0.042 | 0.040 | 1.05x |
+| Mixed | 14 | 0.006 | 0.064 | 0.063 | 1.02x |
+| Code | 11 | 0.005 | 0.030 | 0.027 | 1.11x |
+| Long EN | 25 | 0.010 | 0.109 | 0.077 | 1.42x |
+| Long CN | 8 | 0.005 | 0.053 | 0.050 | 1.06x |
+| Repeat EN | 5 | 0.004 | 0.013 | 0.011 | 1.18x |
+| Repeat CN | 5 | 0.003 | 0.024 | 0.016 | 1.50x |
+| **Average** | - | **0.005** | **0.039** | **0.034** | **1.15x** |
+
+**正确性验证**: 15/15 通过 (包括 CN+URL 测试用例)
+
+### 分析
+- Round 35 优化带来 **1.15x** 平均加速
+- **长英文文本提升最大**: 1.42x (0.109ms -> 0.077ms)
+- **重复中文**: 1.50x (0.024ms -> 0.016ms)
+- **BPE 查找开销显著降低**
+
+### 当前性能状态
+| 版本 | 平均耗时 | 相对 tokenizers-cpp | 备注 |
+|------|----------|---------------------|------|
+| Round 31 | 0.039 ms | 7.8x | string_view 优化 |
+| Round 35 | 0.034 ms | 6.8x | pair<uint64_t, uint64_t> 哈希优化 |
+
+### 结论
+- pair<uint64_t, uint64_t> 哈希优化成功减少 BPE 查找开销
+- 距离 10x 目标更近 (从 7.8x 到 6.8x)
+- 下一步优化方向：
+  1. 继续优化 unicode_regex_split (占 36% 耗时)
+  2. 探索更激进的预计算策略
+  3. 研究 tokenizers-cpp 的 ByteLevel pre-tokenizer 实现

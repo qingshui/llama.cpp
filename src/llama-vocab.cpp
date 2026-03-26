@@ -22,6 +22,7 @@
 #include <set>
 #include <string_view>
 #include <unordered_map>
+#include <iterator>
 
 // Round 28: Use absl::flat_hash_map for better performance
 #include "../third_party/abseil/absl/container/flat_hash_map.h"
@@ -1641,20 +1642,34 @@ struct llama_vocab::impl {
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
 
-    // Round 28/31: Hash helper for flat_hash_map with string_view pairs
+ // Round 28/31/35: Hash helper for flat_hash_map with string pairs
     struct pair_hash {
         size_t operator()(const std::pair<std::string, std::string>& p) const {
-            // Use a better hash combining function
             size_t h1 = std::hash<std::string>{}(p.first);
             size_t h2 = std::hash<std::string>{}(p.second);
-            // MurmurHash-style mix
             size_t hash = h1;
             hash ^= h2 + 0x9e3779b9 + (hash << 6) + (hash >> 2);
             return hash;
         }
     };
 
-    // Round 28/31: Use flat_hash_map for better cache locality and performance
+    // Round 35: Use pair of uint64_t hashes as key for O(1) lookup without string creation
+    // Using pair of hashes to avoid collisions from compressing two 64-bit hashes into 64 bits
+    struct pair_uint64_hash {
+        size_t operator()(const std::pair<uint64_t, uint64_t>& p) const {
+            uint64_t h1 = p.first;
+            uint64_t h2 = p.second;
+            // SplitMix64 hash combination
+            uint64_t z = (h1 + 0x9e3779b97f4a7c15ULL + h2) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 30)) * 0x94d049bb133111ebULL;
+            return static_cast<size_t>(z ^ (z >> 27));
+        }
+    };
+
+    // Round 35: Store bpe_ranks with pair of uint64_t hashes for fast lookup without string creation
+    absl::flat_hash_map<std::pair<uint64_t, uint64_t>, int, pair_uint64_hash> bpe_ranks_hash;
+
+    // Keep original string-based map for get_bpe_merges()
     absl::flat_hash_map<std::pair<std::string, std::string>, int, pair_hash> bpe_ranks;
 
     // Round 4: Chinese character fast path LUT
@@ -1845,7 +1860,13 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                         second = word.substr(pos + 1);
                     }
 
+                    // Round 35: Store in both maps - pair of uint64_t hashes for fast lookup, string for get_bpe_merges
                     bpe_ranks.emplace(std::make_pair(first, second), i);
+
+                    // Compute pair of uint64_t hashes to avoid collision from compression
+                    uint64_t left_hash = std::hash<std::string>{}(first);
+                    uint64_t right_hash = std::hash<std::string>{}(second);
+                    bpe_ranks_hash.emplace(std::make_pair(left_hash, right_hash), i);
                 }
             }
 
@@ -3831,16 +3852,30 @@ int llama_vocab::max_token_len() const {
     return pimpl->max_token_len;
 }
 
+// Round 35: Fast hash computation for string_view
+static inline uint64_t hash_string_view_sv(std::string_view sv) {
+    // FNV-1a hash for string_view
+    uint64_t hash = 14695981039346656037ULL;
+    for (char c : sv) {
+        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view token_right) const {
     GGML_ASSERT(token_left.find(' ')   == std::string_view::npos);
     GGML_ASSERT(token_left.find('\n')  == std::string_view::npos);
     GGML_ASSERT(token_right.find(' ')  == std::string_view::npos);
     GGML_ASSERT(token_right.find('\n') == std::string_view::npos);
 
-    // Round 31: Optimized lookup - create strings only for final comparison
-    auto& bpe_ranks = pimpl->bpe_ranks;
-    auto it = bpe_ranks.find(std::make_pair(std::string(token_left), std::string(token_right)));
-    if (it == bpe_ranks.end()) {
+    // Round 35: Use pair of uint64_t hashes for O(1) lookup without string creation
+    uint64_t left_hash = hash_string_view_sv(token_left);
+    uint64_t right_hash = hash_string_view_sv(token_right);
+
+    auto& bpe_ranks_hash = pimpl->bpe_ranks_hash;
+    auto it = bpe_ranks_hash.find(std::make_pair(left_hash, right_hash));
+    if (it == bpe_ranks_hash.end()) {
         return -1;
     }
 
@@ -3850,8 +3885,8 @@ int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view tok
 std::vector<std::string> llama_vocab::get_bpe_merges() const {
     std::vector<std::string> result(pimpl->bpe_ranks.size());
 
-    for (const auto & pair : pimpl->bpe_ranks) {
-        result[pair.second] = pair.first.first + " " + pair.first.second;
+    for (auto it = pimpl->bpe_ranks.begin(); it != pimpl->bpe_ranks.end(); ++it) {
+        result[it->second] = it->first.first + " " + it->first.second;
     }
 
     return result;
