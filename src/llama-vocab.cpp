@@ -1888,9 +1888,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     // Round 35: Store in both maps - pair of uint64_t hashes for fast lookup, string for get_bpe_merges
                     bpe_ranks.emplace(std::make_pair(first, second), i);
 
-                    // Compute pair of uint64_t hashes to avoid collision from compression
-                    uint64_t left_hash = std::hash<std::string>{}(first);
-                    uint64_t right_hash = std::hash<std::string>{}(second);
+                    // Round 39: Use hash_string_view_sv for consistency with find_bpe_rank
+                    // Bug fix: Previously used std::hash<std::string> which didn't match hash_string_view_sv
+                    uint64_t left_hash = hash_string_view_sv(first);
+                    uint64_t right_hash = hash_string_view_sv(second);
                     bpe_ranks_hash.emplace(std::make_pair(left_hash, right_hash), i);
                 }
             }
