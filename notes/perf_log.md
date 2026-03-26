@@ -1231,6 +1231,38 @@ bpe_ranks_hash.emplace(std::make_pair(left_hash, right_hash), i);
 - "Hello" → [9419] ✅ (修复前：[39,68,75,75,78] 字符级)
 - 剩余差异来自 ByteLevel pre-tokenizer 架构差异，非 bug
 
+### 性能结果 (2026-03-26 17:00) - tokenizers-cpp 纯 C++ 版本对比
+
+使用 `/home/disk4/humingqing/work/tokenizers-cpp` 纯 C++ 版本对比：
+
+| 测试 | Tokens | tokenizers-cpp (ms) | llama.cpp (ms) | tokenizers-cpp 加速比 |
+|------|--------|---------------------|----------------|----------------------|
+| Short EN | 4 | 0.002 | 0.010 | 5.0x |
+| Short CN | 4 | 0.003 | 0.011 | 3.7x |
+| Medium EN | 10 | 0.005 | 0.027 | 5.4x |
+| Medium CN | 9 | 0.005 | 0.027 | 5.4x |
+| Mixed | 14 | 0.006 | 0.044 | 7.3x |
+| Code | 11 | 0.005 | 0.025 | 5.0x |
+| Long EN | 25 | 0.010 | 0.085 | 8.5x |
+| Long CN | 8 | 0.005 | 0.033 | 6.6x |
+| Repeat EN | 5 | 0.004 | 0.014 | 3.5x |
+| Repeat CN | 5 | 0.003 | 0.015 | 5.0x |
+| **Average** | - | **0.005** | **0.029** | **5.8x** |
+
+**正确性**: 5/10 通过
+
+**差异说明**:
+- tokenizers-cpp 使用 ByteLevel BPE (`FromBlobByteLevelBPE`)
+- llama.cpp 使用 Qwen35 预处理 (unicode_regex_split_custom_llama3)
+- 英文文本 token 数量差异明显（如 Long EN: cpp 25 vs llama 49）
+- 中文文本正确性较高（5 个中文测试全部通过）
+- 性能差距：tokenizers-cpp 平均时间是 llama.cpp 的 16.4%（快约 6 倍）
+
+**注意**: 之前的 Python transformers 测试结果 (0.041ms) 与纯 C++ tokenizers-cpp (0.005ms) 差距较大，原因是：
+1. Python 绑定有额外的 overhead
+2. 纯 C++ 版本直接调用 Rust tokenizers 库，性能更优
+3. llama.cpp 仍有优化空间，尤其是 unicode_regex_split 阶段
+
 ## 当前性能总结 (2026-03-26)
 
 | 版本 | 平均耗时 | 相对 tokenizers-cpp | 累计提升 |
