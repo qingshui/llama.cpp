@@ -715,11 +715,16 @@ static std::vector<size_t> unicode_regex_split_ascii_gpt2(const char* str, size_
 
     size_t pos = 0;
     while (pos < len) {
-        // Skip leading whitespace
-        while (pos < len && str[pos] == ' ') pos++;
-        if (pos >= len) break;
-
         size_t start = pos;
+
+        // Handle whitespace (including spaces)
+        if (str[pos] == ' ') {
+            while (pos < len && str[pos] == ' ') {
+                pos++;
+            }
+            bpe_offsets.push_back(pos - start);
+            continue;
+        }
 
         // Handle contractions: 's, 't, 're, 've, 'm, 'll, 'd
         if (str[pos] == '\'' && pos + 1 < len) {
