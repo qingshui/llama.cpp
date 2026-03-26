@@ -141,6 +141,7 @@ struct llama_vocab {
     int max_token_len() const;
 
     int find_bpe_rank(std::string_view token_left, std::string_view token_right) const;
+    int find_bpe_rank(uint64_t left_hash, uint64_t right_hash) const;  // Round 41: Pre-computed hash overload
     std::vector<std::string> get_bpe_merges() const;
 
     std::vector<char> get_precompiled_charsmap() const;

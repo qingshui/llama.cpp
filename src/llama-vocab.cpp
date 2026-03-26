@@ -278,6 +278,18 @@ static inline uint64_t hash_string_view_sv(std::string_view sv) {
     return hash;
 }
 
+// Round 41: Compute FNV-1a hash of concatenated string_views efficiently
+// Continues FNV-1a computation from left_hash over right string bytes
+static inline uint64_t hash_concat_string_views(uint64_t left_hash, std::string_view right) {
+    // Continue FNV-1a from left_hash over right string
+    uint64_t hash = left_hash;
+    for (char c : right) {
+        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 struct llm_bigram_bpe {
     struct comparator {
         bool operator()(const llm_bigram_bpe & l, const llm_bigram_bpe & r) const {
@@ -631,8 +643,8 @@ struct llm_tokenizer_bpe_session {
 
                 // merge the right sym into the left one
                 left_symbol.text = std::string_view(left_symbol.text.data(), left_symbol.text.size() + right_symbol.text.size());
-                // Round 38: Update hash for merged symbol
-                left_symbol.text_hash = hash_string_view_sv(left_symbol.text);
+                // Round 41: Update hash efficiently by continuing FNV-1a from left hash over right string
+                left_symbol.text_hash = hash_concat_string_views(left_symbol.text_hash, right_symbol.text);
                 right_symbol.text = std::string_view();  // empty view
                 right_symbol.text_hash = 0;
 
@@ -696,7 +708,9 @@ private:
 
         int rank_found = -1;
 
-        rank_found = vocab.find_bpe_rank(left_sv, right_sv);
+        // Round 41: Use pre-computed hashes from symbols to avoid redundant hash computation
+        // This saves 2 hash computations per add_new_bigram call
+        rank_found = vocab.find_bpe_rank(symbols[left].text_hash, symbols[right].text_hash);
 
         if (rank_found < 0) {
             return;
@@ -709,8 +723,9 @@ private:
         // Round 31: Use string_view directly - no allocation needed
         // The text points to the concatenated symbols which will remain valid during BPE processing
         bigram.text  = std::string_view(left_sv.data(), left_sv.size() + right_sv.size());
-        // Round 37: Pre-compute hash for fast validation in merge loop
-        bigram.text_hash = hash_string_view_sv(bigram.text);
+        // Round 41: Compute hash efficiently by continuing FNV-1a from left hash over right string
+        // This avoids a full re-hash: we only iterate over right string bytes
+        bigram.text_hash = hash_concat_string_views(symbols[left].text_hash, right_sv);
         bigram.size  = left_sv.size() + right_sv.size();
         bigram.rank  = rank_found;
 
@@ -3869,6 +3884,18 @@ int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view tok
     uint64_t left_hash = hash_string_view_sv(token_left);
     uint64_t right_hash = hash_string_view_sv(token_right);
 
+    auto& bpe_ranks_hash = pimpl->bpe_ranks_hash;
+    auto it = bpe_ranks_hash.find(std::make_pair(left_hash, right_hash));
+    if (it == bpe_ranks_hash.end()) {
+        return -1;
+    }
+
+    return it->second;
+}
+
+// Round 41: Overload with pre-computed hashes to avoid redundant hash computation
+// Used when caller already has hashes (e.g., from llm_symbol::text_hash)
+int llama_vocab::find_bpe_rank(uint64_t left_hash, uint64_t right_hash) const {
     auto& bpe_ranks_hash = pimpl->bpe_ranks_hash;
     auto it = bpe_ranks_hash.find(std::make_pair(left_hash, right_hash));
     if (it == bpe_ranks_hash.end()) {
