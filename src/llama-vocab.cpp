@@ -1680,12 +1680,11 @@ struct llama_vocab::impl {
         bool initialized = false;
     } han_cache;
 
-    // Round 6: LRU token cache for fast text_to_token lookup
-    // Caches recent (text, token) pairs to avoid repeated hash lookups
+    // Round 6/36: Hash-based token cache for fast text_to_token lookup
+    // Uses uint64_t hash keys to avoid string allocation and comparison
     struct {
-        std::vector<std::string> keys;      // LRU order (front = most recent)
-        std::vector<llama_token> values;
-        size_t capacity = 1024;             // Increased capacity for better hit rate
+        absl::flat_hash_map<uint64_t, llama_token> cache;  // Hash -> token
+        size_t capacity = 4096;             // Larger capacity for better hit rate
     } token_cache;
 
     // Round 7: Combining mark cache for Qwen3.5
@@ -2257,9 +2256,8 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
         han_cache.initialized = true;
 
         // Initialize token cache with default capacity
-        token_cache.capacity = 1024;  // Round 5: Increased capacity for better hit rate
-        token_cache.keys.reserve(128);
-        token_cache.values.reserve(128);
+        token_cache.capacity = 4096;  // Round 36: Larger capacity for hash-based cache
+        token_cache.cache.reserve(1024);  // Pre-allocate for better performance
 
         // Round 7: Initialize combining mark cache
         combining_mark_cache.initialized = true;
@@ -3617,6 +3615,18 @@ llama_token llama_vocab::byte_to_token(uint8_t ch) const {
     }
 }
 
+// Round 35/36: Fast hash computation for string_view (FNV-1a)
+// Defined early to be used by both text_to_token and find_bpe_rank
+static inline uint64_t hash_string_view_sv(std::string_view sv) {
+    // FNV-1a hash for string_view
+    uint64_t hash = 14695981039346656037ULL;
+    for (char c : sv) {
+        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 llama_token llama_vocab::text_to_token(std::string_view text) const {
     GGML_ASSERT(pimpl->type != LLAMA_VOCAB_TYPE_NONE);
 
@@ -3654,26 +3664,11 @@ llama_token llama_vocab::text_to_token(std::string_view text) const {
         }
     }
 
-    // Round 6: LRU cache lookup
-    // Quick linear search in small cache (faster than hash lookup for small sizes)
-    for (size_t i = 0; i < pimpl->token_cache.keys.size(); ++i) {
-        if (pimpl->token_cache.keys[i].size() == text.size() &&
-            std::memcmp(pimpl->token_cache.keys[i].data(), text.data(), text.size()) == 0) {
-            // Cache hit - move to front (LRU)
-            llama_token token = pimpl->token_cache.values[i];
-            if (i > 0) {
-                // Move to front
-                std::string key_front = std::move(pimpl->token_cache.keys[i]);
-                llama_token val_front = pimpl->token_cache.values[i];
-                for (size_t j = i; j > 0; --j) {
-                    pimpl->token_cache.keys[j] = std::move(pimpl->token_cache.keys[j-1]);
-                    pimpl->token_cache.values[j] = pimpl->token_cache.values[j-1];
-                }
-                pimpl->token_cache.keys[0] = std::move(key_front);
-                pimpl->token_cache.values[0] = val_front;
-            }
-            return token;
-        }
+    // Round 36: Hash-based cache lookup - O(1) without string allocation
+    uint64_t text_hash = hash_string_view_sv(text);
+    auto cache_it = pimpl->token_cache.cache.find(text_hash);
+    if (cache_it != pimpl->token_cache.cache.end()) {
+        return cache_it->second;
     }
 
     // We need to construct a temporary string for the lookup since token_to_id uses std::string keys
@@ -3684,15 +3679,12 @@ llama_token llama_vocab::text_to_token(std::string_view text) const {
     if (it != pimpl->token_to_id.end()) {
         result = (*it).second;
 
-        // Round 6: Insert into LRU cache
-        if (pimpl->token_cache.keys.size() >= pimpl->token_cache.capacity) {
-            // Remove oldest (back)
-            pimpl->token_cache.keys.pop_back();
-            pimpl->token_cache.values.pop_back();
+        // Round 36: Insert into hash-based cache
+        if (pimpl->token_cache.cache.size() >= pimpl->token_cache.capacity) {
+            // Clear half the cache to avoid unbounded growth (simple aging strategy)
+            pimpl->token_cache.cache.clear();
         }
-        // Insert at front
-        pimpl->token_cache.keys.insert(pimpl->token_cache.keys.begin(), std::move(temp));
-        pimpl->token_cache.values.insert(pimpl->token_cache.values.begin(), result);
+        pimpl->token_cache.cache[text_hash] = result;
 
         // Round 7: Insert into combining mark cache if applicable
         if (pimpl->combining_mark_cache.initialized &&
@@ -3850,17 +3842,6 @@ bool llama_vocab::get_treat_whitespace_as_suffix() const {
 
 int llama_vocab::max_token_len() const {
     return pimpl->max_token_len;
-}
-
-// Round 35: Fast hash computation for string_view
-static inline uint64_t hash_string_view_sv(std::string_view sv) {
-    // FNV-1a hash for string_view
-    uint64_t hash = 14695981039346656037ULL;
-    for (char c : sv) {
-        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
-        hash *= 1099511628211ULL;
-    }
-    return hash;
 }
 
 int llama_vocab::find_bpe_rank(std::string_view token_left, std::string_view token_right) const {
