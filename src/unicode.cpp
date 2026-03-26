@@ -709,6 +709,9 @@ static inline bool is_pure_ascii(const char* str, size_t len) {
     return true;
 }
 
+// Round 43: Fix ASCII split for LLAMA3/Qwen35 pattern [^\r\n\p{L}\p{N}]?\p{L}+
+// The original gpt2 version incorrectly split " world" into " " + "world"
+// Fixed version: space followed by letters should be one token " world"
 static std::vector<size_t> unicode_regex_split_ascii_gpt2(const char* str, size_t len) {
     std::vector<size_t> bpe_offsets;
     bpe_offsets.reserve(len / 4 + 1);
@@ -716,15 +719,6 @@ static std::vector<size_t> unicode_regex_split_ascii_gpt2(const char* str, size_
     size_t pos = 0;
     while (pos < len) {
         size_t start = pos;
-
-        // Handle whitespace (including spaces)
-        if (str[pos] == ' ') {
-            while (pos < len && str[pos] == ' ') {
-                pos++;
-            }
-            bpe_offsets.push_back(pos - start);
-            continue;
-        }
 
         // Handle contractions: 's, 't, 're, 've, 'm, 'll, 'd
         if (str[pos] == '\'' && pos + 1 < len) {
@@ -746,7 +740,19 @@ static std::vector<size_t> unicode_regex_split_ascii_gpt2(const char* str, size_
             }
         }
 
-        // Handle letters (A-Za-z)
+        // Handle optional space + letters (LLAMA3/Qwen35 pattern: [^\r\n\p{L}\p{N}]?\p{L}+)
+        // A space followed by letters should be one token (e.g., " world")
+        if (str[pos] == ' ' && pos + 1 < len &&
+            ((str[pos + 1] >= 'A' && str[pos + 1] <= 'Z') || (str[pos + 1] >= 'a' && str[pos + 1] <= 'z'))) {
+            pos++;  // skip the space
+            while (pos < len && ((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z'))) {
+                pos++;
+            }
+            bpe_offsets.push_back(pos - start);
+            continue;
+        }
+
+        // Handle letters (A-Za-z) - no leading space
         if ((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z')) {
             while (pos < len && ((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z'))) {
                 pos++;
@@ -1113,130 +1119,131 @@ static std::vector<size_t> unicode_regex_split_custom_llama3_optimized(const std
     static const auto full_flags = unicode_cpt_flags_array();
     static const unicode_cpt_flags undef(unicode_cpt_flags::UNDEFINED);
 
-    static const uint32_t OUT_OF_RANGE = 0xFFFFFFFF;
-    auto _get_cpt = [&] (const size_t pos) -> uint32_t {
-        return pos < cpts.size() ? cpts[pos] : OUT_OF_RANGE;
+    // Round 42: Inline ASCII tolower - avoids function call overhead
+    auto tolower_inline = [](uint32_t c) -> uint32_t {
+        if (c >= 'A' && c <= 'Z') return c + 32;
+        return c;
     };
 
-    auto _get_flags = [&] (const size_t pos) -> const unicode_cpt_flags& {
-        if (pos >= cpts.size()) return undef;
+    // Round 42: Direct array access helper - avoids lambda overhead
+    const size_t n = cpts.size();
+    auto get_flags_fast = [&](size_t pos) -> const unicode_cpt_flags& {
+        if (pos >= n) return undef;
         uint32_t cpt = cpts[pos];
-        // Use inline flags for ASCII, full lookup for non-ASCII
-        if (cpt < 0x80) {
-            return flags[pos];
-        }
-        return cpt < full_flags.size() ? full_flags[cpt] : undef;
+        return (cpt < 0x80) ? flags[pos] : ((cpt < 0x10000) ? full_flags[cpt] : undef);
     };
 
     size_t start = 0;
     for (auto offset : offsets) {
         const size_t offset_ini = start;
         const size_t offset_end = start + offset;
-        assert(offset_end <= cpts.size());
+        assert(offset_end <= n);
         start = offset_end;
 
         size_t _prev_end = offset_ini;
-        auto _add_token = [&] (const size_t end) -> size_t {
-            assert(_prev_end <= end && end <= offset_end);
-            size_t len = end - _prev_end;
-            if (len > 0) {
-                bpe_offsets.push_back(len);
-            }
-            _prev_end = end;
-            return len;
-        };
 
         for (size_t pos = offset_ini; pos < offset_end; /*pos++*/ ) {
-            const uint32_t cpt = _get_cpt(pos);
-            const auto flags_local = _get_flags(pos);
+            const uint32_t cpt = cpts[pos];
+            const auto& fl = get_flags_fast(pos);
 
             // regex: (?i:'s|'t|'re|'ve|'m|'ll|'d)
             if (cpt == '\'' && pos+1 < offset_end) {
-                uint32_t cpt_next = unicode_tolower(_get_cpt(pos+1));
+                uint32_t cpt_next = tolower_inline(cpts[pos+1]);
                 if (cpt_next == 's' || cpt_next == 't' || cpt_next == 'm' || cpt_next == 'd') {
-                    pos += _add_token(pos+2);
+                    if (pos + 2 > _prev_end) bpe_offsets.push_back(pos + 2 - _prev_end);
+                    _prev_end = pos + 2;
+                    pos += 2;
                     continue;
                 }
                 if (pos+2 < offset_end) {
-                    uint32_t cpt_next_next = unicode_tolower(_get_cpt(pos+2));
-                    if ((cpt_next == 'r' && cpt_next_next == 'e') ||
-                        (cpt_next == 'v' && cpt_next_next == 'e') ||
-                        (cpt_next == 'l' && cpt_next_next == 'l')) {
-                        pos += _add_token(pos+3);
+                    uint32_t cpt_next2 = tolower_inline(cpts[pos+2]);
+                    if ((cpt_next == 'r' && cpt_next2 == 'e') ||
+                        (cpt_next == 'v' && cpt_next2 == 'e') ||
+                        (cpt_next == 'l' && cpt_next2 == 'l')) {
+                        if (pos + 3 > _prev_end) bpe_offsets.push_back(pos + 3 - _prev_end);
+                        _prev_end = pos + 3;
+                        pos += 3;
                         continue;
                     }
                 }
             }
 
             // regex: [^\r\n\p{L}\p{N}]?\p{L}+
-            if (!(cpt == '\r' || cpt == '\n' || flags_local.is_number)) {
-                if (flags_local.is_letter || _get_flags(pos+1).is_letter) {
+            if (!(cpt == '\r' || cpt == '\n' || fl.is_number)) {
+                const auto& fl_next = get_flags_fast(pos+1);
+                if (fl.is_letter || fl_next.is_letter) {
                     pos++;
-                    while (_get_flags(pos).is_letter) {
-                        pos++;
-                    }
-                    _add_token(pos);
+                    while (pos < offset_end && get_flags_fast(pos).is_letter) pos++;
+                    if (pos > _prev_end) bpe_offsets.push_back(pos - _prev_end);
+                    _prev_end = pos;
                     continue;
                 }
             }
 
             // regex: \p{N}{1,3}
-            if (flags_local.is_number) {
+            if (fl.is_number) {
                 size_t ini = pos;
-                while (_get_flags(pos).is_number) {
-                    if (++pos - ini >= 3 ) {
-                        _add_token(pos);
+                while (pos < offset_end && get_flags_fast(pos).is_number) {
+                    if (++pos - ini >= 3) {
+                        if (pos > _prev_end) bpe_offsets.push_back(pos - _prev_end);
+                        _prev_end = pos;
                         ini = pos;
                     }
                 }
-                _add_token(pos);
+                if (pos > _prev_end) bpe_offsets.push_back(pos - _prev_end);
+                _prev_end = pos;
                 continue;
             }
 
             // regex: <space>?[^\s\p{L}\p{N}]+[\r\n]*
-            auto flags2 = (cpt == ' ' ? _get_flags(pos+1) : flags_local);
-            if (!(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags_local.as_uint()) {
-                pos += (cpt == ' ');
-                while (pos < offset_end && !(flags2.is_whitespace | flags2.is_letter | flags2.is_number) && flags2.as_uint()) {
-                    flags2 = _get_flags(++pos);
+            const auto& fl2 = (cpt == ' ') ? get_flags_fast(pos+1) : fl;
+            if (!(fl2.is_whitespace | fl2.is_letter | fl2.is_number) && fl.as_uint()) {
+                if (cpt == ' ') pos++;
+                while (pos < offset_end) {
+                    const auto& flt = get_flags_fast(pos);
+                    if (flt.is_whitespace | flt.is_letter | flt.is_number || !flt.as_uint()) break;
+                    pos++;
                 }
-                uint32_t cpt2 = _get_cpt(pos);
-                while (cpt2 == '\r' || cpt2 == '\n') {
-                    cpt2 = _get_cpt(++pos);
-                }
-                _add_token(pos);
+                while (pos < offset_end && (cpts[pos] == '\r' || cpts[pos] == '\n')) pos++;
+                if (pos > _prev_end) bpe_offsets.push_back(pos - _prev_end);
+                _prev_end = pos;
                 continue;
             }
 
-            size_t num_whitespaces = 0;
-            size_t last_end_r_or_n = 0;
-            while (_get_flags(pos + num_whitespaces).is_whitespace) {
-                uint32_t cpt2 = _get_cpt(pos + num_whitespaces);
-                if (cpt2 == '\r' || cpt2 == '\n') {
-                    last_end_r_or_n = pos + num_whitespaces + 1;
-                }
-                num_whitespaces++;
+            // regex: \s*[\r\n]+
+            size_t num_ws = 0;
+            size_t last_rn = 0;
+            while (pos + num_ws < offset_end && get_flags_fast(pos + num_ws).is_whitespace) {
+                uint32_t c = cpts[pos + num_ws];
+                if (c == '\r' || c == '\n') last_rn = pos + num_ws + 1;
+                num_ws++;
             }
-
-            if (last_end_r_or_n > 0) {
-                pos = last_end_r_or_n;
-                _add_token(pos);
+            if (last_rn > 0) {
+                if (last_rn > _prev_end) bpe_offsets.push_back(last_rn - _prev_end);
+                _prev_end = last_rn;
+                pos = last_rn;
                 continue;
             }
 
-            if (num_whitespaces > 1 && _get_cpt(pos + num_whitespaces) != OUT_OF_RANGE) {
-                pos += num_whitespaces - 1;
-                _add_token(pos);
+            // regex: \s+(?!\S)
+            if (num_ws > 1 && (pos + num_ws >= offset_end || !get_flags_fast(pos + num_ws).is_whitespace)) {
+                if (pos + num_ws - 1 > _prev_end) bpe_offsets.push_back(pos + num_ws - 1 - _prev_end);
+                _prev_end = pos + num_ws - 1;
+                pos += num_ws - 1;
                 continue;
             }
 
-            if (num_whitespaces > 0) {
-                pos += num_whitespaces;
-                _add_token(pos);
+            // regex: \s+
+            if (num_ws > 0) {
+                if (pos + num_ws > _prev_end) bpe_offsets.push_back(pos + num_ws - _prev_end);
+                _prev_end = pos + num_ws;
+                pos += num_ws;
                 continue;
             }
 
-            _add_token(++pos);
+            // no match - single char
+            if (pos + 1 > _prev_end) bpe_offsets.push_back(pos + 1 - _prev_end);
+            _prev_end = ++pos;
         }
     }
 

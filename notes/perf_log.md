@@ -1423,3 +1423,114 @@ bpe_ranks_hash.emplace(std::make_pair(left_hash, right_hash), i);
   1. 继续优化 unicode_regex_split (占 36% 耗时)
   2. 探索更激进的预计算策略
   3. 研究 tokenizers-cpp 的 ByteLevel pre-tokenizer 实现
+
+## Round 42: unicode_regex_split 内联优化 (2026-03-26)
+
+### 优化内容
+- 在 `unicode_regex_split_custom_llama3_optimized` 函数中减少 lambda 开销
+- 添加 `tolower_inline` 内联函数，避免 `unicode_tolower` 调用
+- 添加 `get_flags_fast` 直接数组访问，避免 `_get_cpt` lambda 开销
+- 移除 `_add_token` lambda，直接 inlining `push_back` 操作
+- 消除 `OUT_OF_RANGE` sentinel 检查
+
+### 修改文件
+- `src/unicode.cpp`: `unicode_regex_split_custom_llama3_optimized` 函数 (lines 1087-1244)
+
+### 性能结果
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 平均耗时 | 0.029ms | 0.026ms | 1.12x |
+
+### 分析
+- unicode_regex_split 占总 tokenize 时间的 ~62.5%
+- 内联优化减少了函数调用开销
+- 长文本提升最明显
+
+---
+
+## Round 43: ByteLevel 编码 Bug 修复 (2026-03-27)
+
+### 问题发现
+- **正确性测试失败**: 5/10 测试用例失败（英文相关）
+- **根因**: `unicode_regex_split_ascii_gpt2` 函数将 " world" 错误分割为 " " + "world"
+- **影响**: llama.cpp 输出 [9419, 11, 220, 14194, 0]，官方输出 [9419, 11, 1814, 0]
+
+### 技术细节
+- Qwen35 regex: `[^\r\n\p{L}\p{N}]?\p{L}+` - 可选非字母数字字符 + 字母
+- 对于 " world"：空格 (非字母数字) + "world" (字母) 应该是一个 token
+- 原代码将空格单独分割，导致 BPE 无法正确合并
+
+### 修复方案
+修改 `unicode_regex_split_ascii_gpt2` 函数：
+```cpp
+// 新增：处理可选空格 + 字母 (LLAMA3/Qwen35 模式)
+if (str[pos] == ' ' && pos + 1 < len &&
+    ((str[pos + 1] >= 'A' && str[pos + 1] <= 'Z') || 
+     (str[pos + 1] >= 'a' && str[pos + 1] <= 'z'))) {
+    pos++;  // skip the space
+    while (pos < len && ((str[pos] >= 'A' && str[pos] <= 'Z') || 
+                         (str[pos] >= 'a' && str[pos] <= 'z'))) {
+        pos++;
+    }
+    bpe_offsets.push_back(pos - start);
+    continue;
+}
+```
+
+### 修改文件
+- `src/unicode.cpp`: `unicode_regex_split_ascii_gpt2` 函数
+
+### 正确性结果
+| 测试 | 修复前 | 修复后 |
+|------|--------|--------|
+| Short EN | ❌ (cpp:4 llama:5) | ✅ (cpp:4 llama:4) |
+| Medium EN | ❌ (cpp:10 llama:19) | ✅ (cpp:10 llama:10) |
+| Code | ❌ (cpp:11 llama:14) | ✅ (cpp:11 llama:11) |
+| Long EN | ❌ (cpp:25 llama:49) | ✅ (cpp:25 llama:25) |
+| Repeat EN | ❌ (cpp:5 llama:9) | ✅ (cpp:5 llama:5) |
+| **总计** | **5/10** | **10/10** ✅ |
+
+### 性能结果
+| 指标 | 修复前 | 修复后 | 变化 |
+|------|--------|--------|------|
+| 平均耗时 | 0.026ms | 0.025ms | 1.04x |
+| tokenizers-cpp 差距 | 5.2x | 5.0x | 改善 |
+
+### 当前性能状态 (2026-03-27)
+| 版本 | 平均耗时 | 相对 tokenizers-cpp | 正确性 |
+|------|----------|---------------------|--------|
+| Round 41 | 0.026 ms | 5.2x | 5/10 ❌ |
+| Round 43 | 0.025 ms | 5.0x | 10/10 ✅ |
+
+### 结论
+- ByteLevel 编码 bug 已修复，正确性测试全部通过
+- 性能略有提升（0.026ms → 0.025ms）
+- 当前差距：tokenizers-cpp 仍快 5.0x（0.005ms vs 0.025ms）
+- 下一步优化方向：
+  1. 继续优化 unicode_regex_split 非 ASCII 路径
+  2. 优化 BPE merge 循环
+  3. 探索 SIMD 加速 UTF-8 解码
+
+---
+
+## 性能总结 (截至 Round 43)
+
+### 整体优化进展
+| 阶段 | 平均耗时 | 相对 Round 0 | 相对 tokenizers-cpp |
+|------|----------|--------------|---------------------|
+| Round 0 (初始) | 1.707 ms | 1x | 341x |
+| Round 41 | 0.026 ms | 65.7x | 5.2x |
+| Round 43 (当前) | 0.025 ms | 68.3x | 5.0x |
+
+### 关键优化里程碑
+1. **Round 3-7**: BPE 查找优化（哈希缓存）- 2-10x 提升
+2. **Round 28-35**: BPE 数据结构优化（pair<uint64_t, uint64_t>）- 1.15x 提升
+3. **Round 41**: BPE merge 哈希优化 - 1.12x 提升
+4. **Round 42**: unicode_regex_split 内联优化 - 1.12x 提升
+5. **Round 43**: ByteLevel 编码 bug 修复 - 正确性 10/10 ✅
+
+### 剩余差距
+- **目标**: 超越 tokenizers-cpp (当前 0.005ms)
+- **当前**: 0.025ms
+- **差距**: 5.0x
+- **剩余优化空间**: unicode_regex_split (~40% 耗时), BPE merge (~35% 耗时)
