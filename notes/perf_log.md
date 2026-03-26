@@ -1094,6 +1094,61 @@ llama.cpp 当前瓶颈：
 - 但合并时仍需重新计算哈希，抵消了部分收益
 - 代码复杂度增加，性能提升有限
 
+## Round 39: 修复 unicode_regex_split_ascii_gpt2 空格字符处理 (2026-03-26)
+
+### 问题描述
+用户报告测试出现大量空格字符问题。经诊断发现：
+- `unicode_regex_split_ascii_gpt2` 函数错误地跳过了所有空格字符
+- 第 719 行：`while (pos < len && str[pos] == ' ') pos++;` 跳过前导空格但不添加 token
+- 第 769-771 行：遇到单个空格时只是 `pos++`，不添加 token
+- 导致末尾空格丢失，例如 "Hello " 只产生 5 个 token（应为 6 个）
+
+### 修复内容
+- 修改 `unicode_regex_split_ascii_gpt2` 函数，将空格作为有效 token 处理
+- 移除跳过空格的逻辑
+- 添加空格处理分支：`while (pos < len && str[pos] == ' ') { pos++; }` 后添加 token
+
+### 修改文件
+- `src/unicode.cpp`: 修改 `unicode_regex_split_ascii_gpt2` 函数（第 712-775 行）
+
+### 正确性验证
+- **Trailing Space 测试**: "Hello " 现在正确产生 6 个 token（包括末尾空格）
+- **所有 15/15 测试用例通过**:
+  - Short EN, Short CN
+  - Medium EN, Medium CN
+  - Mixed, Code
+  - Long EN, Long CN
+  - Repeat EN, Repeat CN
+  - CN+URL, CN+URL2, CN+URL3, CN+URL4, CN+URL5
+
+### 性能结果 (2026-03-26)
+
+| 测试 | Tokens | Round 38 (ms) | Round 39 (ms) | 变化 |
+|------|--------|---------------|---------------|------|
+| Short EN | 13 | 0.009 | 0.009 | 1.00x |
+| Short CN | 18 | 0.011 | 0.011 | 1.00x |
+| Medium EN | 44 | 0.024 | 0.024 | 1.00x |
+| Medium CN | 54 | 0.022 | 0.022 | 1.00x |
+| Mixed | 84 | 0.034 | 0.034 | 1.00x |
+| Code | 41 | 0.020 | 0.020 | 1.00x |
+| Long EN | 153 | 0.068 | 0.068 | 1.00x |
+| Long CN | 69 | 0.027 | 0.027 | 1.00x |
+| Repeat EN | 19 | 0.012 | 0.012 | 1.00x |
+| Repeat CN | 30 | 0.014 | 0.014 | 1.00x |
+| CN+URL | 52 | 0.024 | 0.024 | 1.00x |
+| CN+URL2 | 59 | 0.026 | 0.026 | 1.00x |
+| CN+URL3 | 67 | 0.030 | 0.030 | 1.00x |
+| CN+URL4 | 42 | 0.020 | 0.020 | 1.00x |
+| CN+URL5 | 41 | 0.020 | 0.020 | 1.00x |
+| **Average** | - | **0.024** | **0.024** | **1.00x** |
+
+**正确性**: 15/15 通过
+
+### 结论
+- 空格字符处理 bug 已修复
+- 性能保持不变（修复不引入额外开销）
+- 所有测试用例（包括 CN+URL）正确性验证通过
+
 ## 当前性能总结 (2026-03-26)
 
 | 版本 | 平均耗时 | 相对 tokenizers-cpp | 累计提升 |
