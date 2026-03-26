@@ -88,6 +88,7 @@ struct llm_symbol {
     index prev;
     index next;
     std::string_view text;
+    uint64_t text_hash;  // Round 38: Pre-computed hash for fast merge validation
 };
 
 static_assert(std::is_trivially_copyable<llm_symbol>::value, "llm_symbol is not trivially copyable");
@@ -265,6 +266,18 @@ public:
     void pop() =  delete;
 };
 
+// Round 35/36/37: Fast hash computation for string_view (FNV-1a)
+// Defined early to be used by llm_bigram_bpe, llm_tokenizer_bpe_session, and llama_vocab
+static inline uint64_t hash_string_view_sv(std::string_view sv) {
+    // FNV-1a hash for string_view
+    uint64_t hash = 14695981039346656037ULL;
+    for (char c : sv) {
+        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 struct llm_bigram_bpe {
     struct comparator {
         bool operator()(const llm_bigram_bpe & l, const llm_bigram_bpe & r) const {
@@ -276,7 +289,8 @@ struct llm_bigram_bpe {
     using queue = llama_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
     llm_symbol::index left;
     llm_symbol::index right;
-    std::string_view text;  // Round 31: Use string_view to avoid allocation - points to symbol data
+    std::string_view text;      // Round 31: Use string_view to avoid allocation - points to symbol data
+    uint64_t text_hash;         // Round 37: Pre-computed hash for fast validation
     int rank;
     size_t size;
 };
@@ -568,7 +582,7 @@ struct llm_tokenizer_bpe_session {
 
             //if (vocab.tokenizer_ignore_merges && vocab.token_to_id.find(word) != vocab.token_to_id.end()) {
             if (vocab.get_ignore_merges() && vocab.text_to_token(word) != LLAMA_TOKEN_NULL) {
-                symbols.emplace_back(llm_symbol{-1, -1, std::string_view(word)});
+                symbols.emplace_back(llm_symbol{-1, -1, std::string_view(word), hash_string_view_sv(std::string_view(word))});
                 offset = word.size();
             }
 
@@ -576,6 +590,8 @@ struct llm_tokenizer_bpe_session {
                 llm_symbol sym;
                 size_t char_len = std::min(word.size() - offset, (size_t) unicode_len_utf8(word[offset]));
                 sym.text = std::string_view(word.c_str() + offset, char_len);
+                // Round 38: Pre-compute hash for fast merge validation
+                sym.text_hash = hash_string_view_sv(sym.text);
                 offset += char_len;
                 sym.prev = index - 1;
                 sym.next = offset == word.size() ? -1 : index + 1;
@@ -596,21 +612,29 @@ struct llm_tokenizer_bpe_session {
                 if (left_symbol.text.empty() || right_symbol.text.empty()) {
                     continue;
                 }
-                // Round 31: Use string_view for comparison - no allocation needed
+                // Round 31/37/38: Fast validation using pre-computed hash
                 std::string_view left_sv = left_symbol.text;
                 std::string_view right_sv = right_symbol.text;
                 if (left_sv.size() + right_sv.size() != bigram.text.size()) {
                     continue;  // Skip this bigram if it's outdated
                 }
-                // Quick check: compare string_views directly
-                if (left_sv.substr(0, std::min(left_sv.size(), bigram.text.size())) !=
-                    bigram.text.substr(0, left_sv.size())) {
-                    continue;
+                // Round 38: Use pre-computed hash from symbol - no need to recompute
+                if (left_symbol.text_hash != bigram.text_hash) {
+                    // Hash mismatch - compute hash of left part of bigram to verify
+                    uint64_t bigram_left_hash = hash_string_view_sv(std::string_view(bigram.text.data(), left_sv.size()));
+                    if (left_symbol.text_hash != bigram_left_hash) {
+                        continue;  // Hash mismatch - bigram is outdated
+                    }
+                    // Update symbol hash if it changed (shouldn't happen normally)
+                    left_symbol.text_hash = bigram_left_hash;
                 }
 
                 // merge the right sym into the left one
                 left_symbol.text = std::string_view(left_symbol.text.data(), left_symbol.text.size() + right_symbol.text.size());
+                // Round 38: Update hash for merged symbol
+                left_symbol.text_hash = hash_string_view_sv(left_symbol.text);
                 right_symbol.text = std::string_view();  // empty view
+                right_symbol.text_hash = 0;
 
                 // remove the right sym from the chain
                 left_symbol.next = right_symbol.next;
@@ -685,6 +709,8 @@ private:
         // Round 31: Use string_view directly - no allocation needed
         // The text points to the concatenated symbols which will remain valid during BPE processing
         bigram.text  = std::string_view(left_sv.data(), left_sv.size() + right_sv.size());
+        // Round 37: Pre-compute hash for fast validation in merge loop
+        bigram.text_hash = hash_string_view_sv(bigram.text);
         bigram.size  = left_sv.size() + right_sv.size();
         bigram.rank  = rank_found;
 
@@ -3613,18 +3639,6 @@ llama_token llama_vocab::byte_to_token(uint8_t ch) const {
         default:
             GGML_ABORT("fatal error");
     }
-}
-
-// Round 35/36: Fast hash computation for string_view (FNV-1a)
-// Defined early to be used by both text_to_token and find_bpe_rank
-static inline uint64_t hash_string_view_sv(std::string_view sv) {
-    // FNV-1a hash for string_view
-    uint64_t hash = 14695981039346656037ULL;
-    for (char c : sv) {
-        hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
-        hash *= 1099511628211ULL;
-    }
-    return hash;
 }
 
 llama_token llama_vocab::text_to_token(std::string_view text) const {
