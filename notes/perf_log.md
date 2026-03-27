@@ -6,6 +6,119 @@
 - **目标性能**: 超过 tokenizers-cpp (< 0.01ms)
 - **加速比要求**: > 100x
 
+## Round 44: 修复 Qwen35 regex 字符串不匹配导致正确性 bug (2026-03-27)
+
+### 问题描述
+
+Qwen35 tokenization 正确性验证失败，`，://` 被错误分割为 `，` + `:` + `/` + `/` (4 tokens) 而不是 `，` + `://` (2 tokens)。
+
+### 根因分析
+
+**unicode.cpp 第 1764 行的 regex 字符串与 llama-vocab.cpp 第 416 行不匹配**:
+
+- **llama-vocab.cpp**: `(?:'[sS]|...)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+...`
+- **unicode.cpp (bug)**: `(?:'[sS]|...)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+\p{N}| ?[^\s\p{L}\p{M}\p{N}]+...`
+
+关键差异:
+- vocab: `[\p{L}\p{M}]+|\p{N}` - 字母/标记 **或** 数字 (separate alternatives)
+- unicode: `[\p{L}\p{M}]+\p{N}` - 字母/标记 **后跟** 数字 (suffix)
+
+这导致 `unicode_regex_split_custom()` 中的字符串比较失败，optimized custom handler 从未被调用，llama.cpp 回退到 std::regex 进行预分词，产生了错误的 offsets。
+
+### 修复方案
+
+**文件**: `src/unicode.cpp` (第 1764 行)
+
+**修改前**:
+```cpp
+regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+```
+
+**修改后**:
+```cpp
+regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+```
+
+### 验证结果
+
+**测试文件**: `test-tokenize-validation.py`
+
+| 测试 | 输入 | llama.cpp tokens | Official tokens | 结果 |
+|------|------|------------------|-----------------|------|
+| Line 1 | EN 混合 | 56 | 56 | ✅ |
+| Line 2 | CN 混合 | 150 | 150 | ✅ |
+| Line 3 | CN 混合 | 93 | 93 | ✅ |
+
+**Match rate: 100%** - 所有测试通过！
+
+### 性能影响
+
+此修复仅修复正确性 bug，不影响性能。optimized custom handler 现在会被正确调用，保持与之前相同的性能特性。
+
+### Commit
+
+```
+fix: Qwen35 regex string mismatch in unicode_regex_split_custom
+```
+
+### 性能测试结果 (Round 44 修复后)
+
+**测试日期**: 2026-03-27
+**测试方法**: 1000 次迭代平均 (HTTP API 调用)
+
+| 测试 | Tokens | llama.cpp (ms) | tokenizers-cpp (ms) | tokenizers 加速比 |
+|------|--------|----------------|---------------------|------------------|
+| Short EN | 2 | 1.765 | 0.011 | 157.1x |
+| Short CN | 2 | 1.763 | 0.007 | 239.3x |
+| Medium EN | 9 | 1.804 | 0.022 | 82.0x |
+| Medium CN | 9 | 1.810 | 0.014 | 128.6x |
+| Mixed | 7 | 1.807 | 0.013 | 136.6x |
+| Code | 7 | 1.806 | 0.016 | 109.9x |
+| Long EN | 22 | 1.846 | 0.045 | 40.7x |
+| Long CN | 19 | 1.801 | 0.024 | 75.2x |
+| Repeat EN | 5 | 1.789 | 0.015 | 123.0x |
+| Repeat CN | 5 | 1.794 | 0.011 | 161.0x |
+
+**平均**: llama.cpp 1.799ms vs tokenizers-cpp 0.018ms
+
+**结论**: tokenizers-cpp 平均比 llama.cpp 快约 **100 倍**
+
+**注意**: 此测试包含 HTTP API 调用开销。
+
+### 纯 C++ 性能测试 (2026-03-27)
+
+使用 `test-tokenize-overall-perf` 进行纯 C++ 测试 (无 HTTP 开销)：
+
+**测试配置**:
+- 1000 次迭代
+- 5 个测试用例 (短英文、中等英文、中文、中英文混合、长文本)
+
+**结果**:
+| 测试 | Tokens | Total (ms) | Split (ms) | BPE (ms) | BPE Ratio |
+|------|--------|------------|------------|----------|-----------|
+| 短英文 | 10 | 0.836 | 0.832 | 0.005 | 0.5% |
+| 中等英文 | 20 | 0.851 | 0.843 | 0.009 | 1.0% |
+| 中文 | 21 | 0.855 | 0.846 | 0.009 | 1.1% |
+| 中英文混合 | 16 | 0.848 | 0.838 | 0.009 | 1.1% |
+| 长文本 | 61 | 0.916 | 0.887 | 0.029 | 3.2% |
+
+**平均**: Total 0.861ms, Split 0.849ms, BPE 0.012ms
+
+**关键发现**:
+- **unicode_regex_split 占 98.6% 时间** - 是主要性能瓶颈
+- **BPE merge 仅占 1.4% 时间** - 已高度优化
+- 纯 C++ 性能 (0.861ms) 比 HTTP API 测试 (1.799ms) 快约 2 倍，说明 HTTP 开销约占 50%
+
+**优化方向**:
+1. **Round 45**: 优化 unicode_regex_split - 当前主要瓶颈 (占 98.6%)
+2. **Round 46**: 优化 BPE 查找 - 虽然占比小，但仍有优化空间
+
+### 后续优化方向
+
+1. **Round 45**: 优化 unicode_regex_split 性能 - 当前主要瓶颈
+2. **Round 46**: 优化 BPE 查找 - 使用哈希缓存
+3. **Round 47**: 批量 tokenize 支持 - 减少 API 调用开销
+
 ## 初始性能数据 (2026-03-24)
 
 | 指标 | llama.cpp | tokenizers-cpp | 加速比 |

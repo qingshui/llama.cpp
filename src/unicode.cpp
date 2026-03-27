@@ -752,6 +752,20 @@ static std::vector<size_t> unicode_regex_split_ascii_gpt2(const char* str, size_
             continue;
         }
 
+        // Handle optional special char + letters (Qwen35 pattern: [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+)
+        // A special char followed by letters should be one token (e.g., "-cli", "/world")
+        if (str[pos] != ' ' && str[pos] != '\r' && str[pos] != '\n' &&
+            !((str[pos] >= '0' && str[pos] <= '9')) &&
+            pos + 1 < len &&
+            ((str[pos + 1] >= 'A' && str[pos + 1] <= 'Z') || (str[pos + 1] >= 'a' && str[pos + 1] <= 'z'))) {
+            pos++;  // skip the special char
+            while (pos < len && ((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z'))) {
+                pos++;
+            }
+            bpe_offsets.push_back(pos - start);
+            continue;
+        }
+
         // Handle letters (A-Za-z) - no leading space
         if ((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z')) {
             while (pos < len && ((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z'))) {
@@ -770,16 +784,51 @@ static std::vector<size_t> unicode_regex_split_ascii_gpt2(const char* str, size_
             continue;
         }
 
-        // Handle other ASCII chars (non-space)
-        if (str[pos] != ' ') {
-            while (pos < len && str[pos] != ' ') {
+        // Handle optional space + special chars (Qwen35 pattern: ?[^\s\p{L}\p{M}\p{N}]+)
+        // A space followed by special chars should be one token (e.g., " -", " .", " !")
+        if (str[pos] == ' ' && pos + 1 < len && str[pos + 1] != ' ' &&
+            !((str[pos + 1] >= 'A' && str[pos + 1] <= 'Z') || (str[pos + 1] >= 'a' && str[pos + 1] <= 'z')) &&
+            !(str[pos + 1] >= '0' && str[pos + 1] <= '9')) {
+            pos++;  // skip the space
+            while (pos < len && str[pos] != ' ' &&
+                   !((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z')) &&
+                   !(str[pos] >= '0' && str[pos] <= '9')) {
                 pos++;
             }
             bpe_offsets.push_back(pos - start);
             continue;
         }
 
-        pos++;
+        // Handle special chars (Qwen35 pattern: ?[^\s\p{L}\p{M}\p{N}]+)
+        // Collect consecutive non-space, non-letter, non-number chars
+        if (str[pos] != ' ' &&
+            !((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z')) &&
+            !(str[pos] >= '0' && str[pos] <= '9')) {
+            while (pos < len && str[pos] != ' ' &&
+                   !((str[pos] >= 'A' && str[pos] <= 'Z') || (str[pos] >= 'a' && str[pos] <= 'z')) &&
+                   !(str[pos] >= '0' && str[pos] <= '9')) {
+                pos++;
+            }
+            bpe_offsets.push_back(pos - start);
+            continue;
+        }
+
+        // Handle single space (Qwen35 pattern: \s+)
+        if (str[pos] == ' ') {
+            // Check if next is also space (multiple spaces = one token)
+            if (pos + 1 < len && str[pos + 1] == ' ') {
+                // Multiple spaces - collect all consecutive spaces
+                while (pos < len && str[pos] == ' ') {
+                    pos++;
+                }
+                bpe_offsets.push_back(pos - start);
+            } else {
+                // Single space - one char token
+                pos++;
+                bpe_offsets.push_back(pos - start);
+            }
+            continue;
+        }
     }
 
     return bpe_offsets;
@@ -1168,12 +1217,13 @@ static std::vector<size_t> unicode_regex_split_custom_llama3_optimized(const std
                 }
             }
 
-            // regex: [^\r\n\p{L}\p{N}]?\p{L}+
+            // regex: [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ (Qwen35/LLAMA3)
+            // Optional special char + one or more letters/marks
             if (!(cpt == '\r' || cpt == '\n' || fl.is_number)) {
                 const auto& fl_next = get_flags_fast(pos+1);
-                if (fl.is_letter || fl_next.is_letter) {
+                if (fl.is_letter || fl.is_accent_mark || fl_next.is_letter) {
                     pos++;
-                    while (pos < offset_end && get_flags_fast(pos).is_letter) pos++;
+                    while (pos < offset_end && (get_flags_fast(pos).is_letter || get_flags_fast(pos).is_accent_mark)) pos++;
                     if (pos > _prev_end) bpe_offsets.push_back(pos - _prev_end);
                     _prev_end = pos;
                     continue;
@@ -1712,7 +1762,7 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
         // Qwen35 regex pattern - similar to LLAMA3 but with \p{M} support for combining marks
         bpe_offsets = unicode_regex_split_custom_llama3_optimized(text, offsets);
     } else if (
-            regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+            regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         // Qwen35 regex pattern (expanded form) - similar to LLAMA3 but with \p{M} support for combining marks
         bpe_offsets = unicode_regex_split_custom_llama3_optimized(text, offsets);
     } else if (regex_expr == "\\p{Han}+") {
