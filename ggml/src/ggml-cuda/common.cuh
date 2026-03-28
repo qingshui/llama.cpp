@@ -29,6 +29,12 @@
 #include <unordered_map>
 #include <vector>
 
+// Forward declaration for EP context
+struct ggml_cuda_ep_context;
+
+// Forward declaration for EP buffer type context
+struct ggml_backend_cuda_expert_split_buffer_type_context;
+
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
 #elif defined(GGML_USE_MUSA)
@@ -1361,6 +1367,12 @@ struct ggml_backend_cuda_context {
         return false;
     }
 #endif // USE_CUDA_GRAPH
+
+#ifdef GGML_CUDA_EP_USE_NCCL
+    // Expert Parallelism context for distributed MoE
+    ggml_cuda_ep_context * ep_context = nullptr;
+    bool ep_mode_enabled = false;
+#endif // GGML_CUDA_EP_USE_NCCL
 
     explicit ggml_backend_cuda_context(int device) :
         device(device),

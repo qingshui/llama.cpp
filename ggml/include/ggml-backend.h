@@ -198,6 +198,8 @@ extern "C" {
 
     // Split buffer type for tensor parallelism
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
+    // Expert split buffer type for MoE Expert Parallelism
+    typedef ggml_backend_buffer_type_t   (*ggml_backend_expert_split_buffer_type_t)(int main_device, const float * tensor_split, int64_t n_experts, int64_t expert_stride);
     // Set the number of threads for the backend
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)

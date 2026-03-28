@@ -181,6 +181,16 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
     endif()
 
+    # Find NCCL for Expert Parallelism AllReduce
+    find_package(NCCL QUIET)
+    if (NCCL_FOUND)
+        message(STATUS "NCCL found - enabling EP AllReduce support")
+        add_compile_definitions(GGML_CUDA_EP_USE_NCCL)
+        target_link_libraries(ggml-cuda PRIVATE NCCL::NCCL)
+    else()
+        message(STATUS "NCCL not found - using fallback cudaMemcpy for EP AllReduce")
+    endif()
+
     set(CUDA_CXX_FLAGS "")
 
     set(CUDA_FLAGS -use_fast_math -extended-lambda)

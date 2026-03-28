@@ -49,6 +49,7 @@
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/moe-ep.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -577,6 +578,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
     }
+
+#ifdef GGML_CUDA_EP_USE_NCCL
+    // Cleanup EP context if it was initialized
+    if (ep_context != nullptr) {
+        ggml_cuda_ep_free(*ep_context);
+        delete ep_context;
+        ep_context = nullptr;
+    }
+#endif
 }
 
 
@@ -1119,6 +1129,146 @@ ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, 
     };
 
     auto result = buft_map.emplace(std::make_pair(main_device, tensor_split_arr), buft);
+    return &result.first->second;
+}
+
+// Expert Parallelism buffer type context
+struct ggml_backend_cuda_expert_split_buffer_type_context {
+    int main_device;
+    std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split;
+    int64_t n_experts;
+    int64_t expert_stride;  // size of each expert in bytes
+    std::string name;
+#ifdef GGML_CUDA_EP_USE_NCCL
+    ggml_cuda_ep_context * ep_context = nullptr;  // EP context for distributed MoE
+#endif
+};
+
+// Expert Parallelism buffer context
+struct ggml_backend_cuda_expert_split_buffer_context {
+    ~ggml_backend_cuda_expert_split_buffer_context() {
+        for (ggml_tensor_extra_gpu * extra : tensor_extras) {
+            for (int id = 0; id < GGML_CUDA_MAX_DEVICES; ++id) {
+                for (int64_t is = 0; is < GGML_CUDA_MAX_STREAMS; ++is) {
+                    if (extra->events[id][is] != nullptr) {
+                        CUDA_CHECK(cudaEventDestroy(extra->events[id][is]));
+                    }
+                }
+                if (extra->data_device[id] != nullptr) {
+                    CUDA_CHECK(cudaFree(extra->data_device[id]));
+                }
+            }
+            delete extra;
+        }
+    }
+
+    std::vector<ggml_tensor_extra_gpu *> tensor_extras;
+};
+
+static const char * ggml_backend_cuda_expert_split_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    ggml_backend_cuda_expert_split_buffer_type_context * ctx = (ggml_backend_cuda_expert_split_buffer_type_context *)buft->context;
+    return ctx->name.c_str();
+}
+
+static bool ggml_backend_buft_is_cuda_expert_split(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_cuda_expert_split_buffer_type_get_name;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_expert_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_expert_split_buffer_type_context * ctx = (ggml_backend_cuda_expert_split_buffer_type_context *)buft->context;
+
+#ifdef GGML_CUDA_EP_USE_NCCL
+    // Initialize EP context on first buffer allocation
+    if (ctx->ep_context == nullptr) {
+        ctx->ep_context = new ggml_cuda_ep_context();
+        ggml_cuda_ep_init(*ctx->ep_context, ctx->n_experts, ctx->tensor_split.data(), ggml_backend_cuda_get_device_count());
+    }
+#endif
+
+    auto * buffer_ctx = new ggml_backend_cuda_expert_split_buffer_context();
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_split_buffer_interface, buffer_ctx, size);
+}
+
+static size_t ggml_backend_cuda_expert_split_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return MATRIX_ROW_PADDING;
+}
+
+static size_t ggml_backend_cuda_expert_split_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    size_t total_size = ggml_nbytes(tensor);
+    return total_size;
+}
+
+static bool ggml_backend_cuda_expert_split_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return false;
+    GGML_UNUSED(buft);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_expert_split_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_cuda_expert_split_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_cuda_expert_split_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_cuda_expert_split_buffer_type_get_alignment,
+    /* .get_max_size     = */ NULL,
+    /* .get_alloc_size   = */ ggml_backend_cuda_expert_split_buffer_type_get_alloc_size,
+    /* .is_host          = */ ggml_backend_cuda_expert_split_buffer_type_is_host,
+};
+
+ggml_backend_buffer_type_t ggml_backend_cuda_expert_split_buffer_type(int main_device, const float * tensor_split, int64_t n_experts, int64_t expert_stride) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    struct ExpertSplitKey {
+        int main_device;
+        std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split;
+        int64_t n_experts;
+        int64_t expert_stride;
+
+        bool operator<(const ExpertSplitKey& other) const {
+            if (main_device != other.main_device) return main_device < other.main_device;
+            if (tensor_split != other.tensor_split) return tensor_split < other.tensor_split;
+            if (n_experts != other.n_experts) return n_experts < other.n_experts;
+            return expert_stride < other.expert_stride;
+        }
+    };
+
+    static std::map<ExpertSplitKey, struct ggml_backend_buffer_type> buft_map;
+
+    std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split_arr = {};
+
+    bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + GGML_CUDA_MAX_DEVICES, [](float x) { return x == 0.0f; });
+    if (all_zero) {
+        tensor_split_arr = ggml_cuda_info().default_tensor_split;
+    } else {
+        float split_sum = 0.0f;
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+            tensor_split_arr[i] = split_sum;
+            split_sum += tensor_split[i];
+        }
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+            tensor_split_arr[i] /= split_sum;
+        }
+    }
+
+    ExpertSplitKey key{main_device, tensor_split_arr, n_experts, expert_stride};
+    auto it = buft_map.find(key);
+    if (it != buft_map.end()) {
+        return &it->second;
+    }
+
+    auto * ctx = new ggml_backend_cuda_expert_split_buffer_type_context;
+    ctx->main_device = main_device;
+    ctx->tensor_split = tensor_split_arr;
+    ctx->n_experts = n_experts;
+    ctx->expert_stride = expert_stride;
+    ctx->name = GGML_CUDA_NAME + std::to_string(main_device) + "_ExpertSplit";
+
+    struct ggml_backend_buffer_type buft {
+        /* .iface   = */ ggml_backend_cuda_expert_split_buffer_type_interface,
+        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), main_device),
+        /* .context = */ ctx,
+    };
+
+    auto result = buft_map.emplace(key, buft);
     return &result.first->second;
 }
 
@@ -2327,7 +2477,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
-    GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
+    // Note: Expert Parallelism (EP) mode now supports split buffers for distributing experts across GPUs
+    // GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -3723,11 +3874,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 out_nodes[1] = i + ops.size() - 1;
 
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                                    ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2)) {
-                                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
-                                    i += ops.size() - 1;
-                                    continue;
+#ifdef GGML_CUDA_EP_USE_NCCL
+                                    // Check if EP mode is enabled and applicable
+                                    if (cuda_ctx->ep_mode_enabled && cuda_ctx->ep_context != nullptr &&
+                                        ggml_cuda_should_use_topk_moe_ep(node, logits, weights, ids, *cuda_ctx->ep_context)) {
+                                        ggml_cuda_op_topk_moe_ep(*cuda_ctx, *cuda_ctx->ep_context,
+                                                                 logits, weights, ids, clamp, scale, bias, args);
+                                        i += ops.size() - 1;
+                                        continue;
+                                    } else
+#endif
+                                    if (ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                        i += ops.size() - 1;
+                                        continue;
+                                    }
                                 }
                             } else if (!args.norm && !args.prob_bias) {
                                 //special case gpt-oss, no norm, no bias.
@@ -3739,11 +3901,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                                 int out_nodes[2] = { i + 1, i + 5 };
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                                    ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2)) {
-                                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
-                                    i += ops.size() - 1;
-                                    continue;
+#ifdef GGML_CUDA_EP_USE_NCCL
+                                    // Check if EP mode is enabled and applicable
+                                    if (cuda_ctx->ep_mode_enabled && cuda_ctx->ep_context != nullptr &&
+                                        ggml_cuda_should_use_topk_moe_ep(softmax, logits, weights, ids, *cuda_ctx->ep_context)) {
+                                        ggml_cuda_op_topk_moe_ep(*cuda_ctx, *cuda_ctx->ep_context,
+                                                                 logits, weights, ids, clamp, scale, bias, args);
+                                        i += ops.size() - 1;
+                                        continue;
+                                    } else
+#endif
+                                    if (ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids)) {
+                                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                                        i += ops.size() - 1;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -4100,6 +4273,25 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+
+#ifdef GGML_CUDA_EP_USE_NCCL
+    // Check if any tensor uses EP buffer type and initialize EP mode
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->buffer && node->buffer->buft &&
+            ggml_backend_buft_is_cuda_expert_split(node->buffer->buft)) {
+            ggml_backend_cuda_expert_split_buffer_type_context * ep_buft_ctx =
+                (ggml_backend_cuda_expert_split_buffer_type_context *)node->buffer->buft->context;
+            if (ep_buft_ctx->ep_context != nullptr && cuda_ctx->ep_context == nullptr) {
+                cuda_ctx->ep_context = ep_buft_ctx->ep_context;
+                cuda_ctx->ep_mode_enabled = true;
+                GGML_LOG_INFO("EP mode enabled with %d devices, %ld experts\n",
+                              cuda_ctx->ep_context->n_devices, long(cuda_ctx->ep_context->n_experts_total));
+            }
+            break;
+        }
+    }
+#endif
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -5213,6 +5405,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_split_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_expert_split_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_expert_split_buffer_type;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

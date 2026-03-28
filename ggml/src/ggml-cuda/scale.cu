@@ -1,6 +1,8 @@
 #include "scale.cuh"
 
-#define MAX_GRIDDIM_X 0x7FFFFFFF
+// Maximum grid dimension X - must be <= 65535 for CUDA hardware compatibility
+// Using same limit as im2col.cu (MAX_GRIDDIM_Z = 65535)
+#define MAX_GRIDDIM_X 65535
 
 static __global__ void scale_f32(const float * x, float * dst, const float scale, const float bias, const int64_t nelements) {
     int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
@@ -13,7 +15,8 @@ static __global__ void scale_f32(const float * x, float * dst, const float scale
 
 static void scale_f32_cuda(const float * x, float * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
     const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
-    scale_f32<<<MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream>>>(x, dst, scale, bias, nelements);
+    const int grid_dim = (int)min((int64_t)MAX_GRIDDIM_X, num_blocks);
+    scale_f32<<<grid_dim, CUDA_SCALE_BLOCK_SIZE, 0, stream>>>(x, dst, scale, bias, nelements);
 }
 
 void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -28,6 +28,32 @@
 #include <sstream>
 #include <stdexcept>
 
+// Helper function to identify MoE expert tensors
+// Only the actual expert FFN weights should be distributed in EP mode
+// NOT the gating network weights (ffn_gate_inp)
+static bool is_moe_expert_tensor(const std::string & tensor_name) {
+    // Match patterns like: blk.N.ffn_gate_exps, blk.N.ffn_up_exps, blk.N.ffn_down_exps, blk.N.ffn_gate_up_exps
+    // These are the actual expert weights that should be distributed across GPUs in EP mode
+    static const std::regex expert_pattern(R"(blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.weight)");
+    // Match patterns like: blk.N.ffn_gate_exps_s, blk.N.ffn_up_exps_s, etc. (LoRA scales for experts)
+    static const std::regex expert_scale_pattern(R"(blk\.\d+\.ffn_(gate|up|down|gate_up)_exps_s\.weight)");
+    // Match expert bias tensors
+    static const std::regex expert_bias_pattern(R"(blk\.\d+\.ffn_(gate|up|down|gate_up)_exps.*\.weight)");
+
+    return std::regex_match(tensor_name, expert_pattern) ||
+           std::regex_match(tensor_name, expert_scale_pattern) ||
+           std::regex_match(tensor_name, expert_bias_pattern);
+}
+
+// Helper function to determine if a tensor should be distributed in EP mode
+static bool should_distribute_in_ep_mode(const std::string & tensor_name) {
+    // For MoE architectures, distribute expert tensors across GPUs
+    if (is_moe_expert_tensor(tensor_name)) {
+        return true;
+    }
+    return false;
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -242,8 +268,8 @@ static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & de
     return buft_list;
 }
 
-// GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
-static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
+// GPU: split if LLAMA_SPLIT_MODE_ROW or LLAMA_SPLIT_MODE_EXPERT -> GPU
+static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split, int64_t n_experts = 0, int64_t expert_stride = 0) {
     buft_list_t buft_list;
 
     // add the device split buffer type if requested and available
@@ -262,6 +288,26 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
                 throw std::runtime_error(format("device %s not found in its backend reg", ggml_backend_dev_name(dev)));
             }();
             auto * buft = ggml_backend_split_buffer_type_fn(dev_index, tensor_split);
+            if (buft != nullptr) {
+                buft_list.emplace_back(dev, buft);
+            }
+        }
+    } else if (split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+        // Expert Parallelism: use expert split buffer type for expert tensors
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto ggml_backend_expert_split_buffer_type_fn = (ggml_backend_expert_split_buffer_type_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_expert_split_buffer_type");
+        if (ggml_backend_expert_split_buffer_type_fn) {
+            size_t dev_index = [&]() {
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+                    if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                        return i;
+                    }
+                }
+                throw std::runtime_error(format("device %s not found in its backend reg", ggml_backend_dev_name(dev)));
+            }();
+            auto * buft = ggml_backend_expert_split_buffer_type_fn(dev_index, tensor_split, n_experts, expert_stride);
             if (buft != nullptr) {
                 buft_list.emplace_back(dev, buft);
             }
@@ -2595,7 +2641,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (auto * dev : devices) {
-        buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
+        // Pass expert info for EP mode
+        int64_t n_experts = hparams.n_expert;
+        int64_t expert_stride = hparams.n_ff() / (n_experts > 0 ? n_experts : 1);  // Approximate expert size
+        buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split, n_experts, expert_stride);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev, std::move(buft_list));
@@ -2699,6 +2748,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             return ml.create_tensor(
                 hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
                 tn, ne, flags);
+        };
+
+        // EP mode: create tensor with expert distribution across GPUs
+        auto create_tensor_ep = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
+            // In Expert Parallelism mode, distribute expert tensors across GPUs
+            if (split_mode == LLAMA_SPLIT_MODE_EXPERT && is_moe_expert_tensor(tn.str())) {
+                // For expert tensors, use the expert split buffer type
+                // The tensor will be distributed based on the expert dimension
+                const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+                return ml.create_tensor(
+                    hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+                    tn, ne, flags | TENSOR_SKIP_IF_VIRTUAL);  // Mark for special EP handling
+            }
+            return create_tensor(tn, ne, flags);
         };
 
         layers.resize(n_layer);

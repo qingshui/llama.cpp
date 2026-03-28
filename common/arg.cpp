@@ -2337,11 +2337,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row}",
+        {"-sm", "--split-mode"}, "{none,layer,row,expert}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs\n"
-        "- row: split rows across GPUs",
+        "- row: split rows across GPUs\n"
+        "- expert: Expert Parallelism for MoE models - split experts across GPUs",
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
             if (arg_next == "none") {
@@ -2350,6 +2351,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_LAYER;
             } else if (arg_next == "row") {
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
+            } else if (arg_next == "expert") {
+                params.split_mode = LLAMA_SPLIT_MODE_EXPERT;
             } else {
                 throw std::invalid_argument("invalid value");
             }

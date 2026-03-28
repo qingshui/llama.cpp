@@ -413,3 +413,90 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
 
     return true;
 }
+
+// Expert Parallelism: Distributed Top-K MoE implementation
+void ggml_cuda_op_topk_moe_ep(ggml_backend_cuda_context &     ctx,
+                              ggml_cuda_ep_context &          ep_ctx,
+                              const ggml_tensor *             logits,
+                              ggml_tensor *                   weights,
+                              ggml_tensor *                   ids,
+                              const ggml_tensor *             clamp,
+                              const ggml_tensor *             scale,
+                              const ggml_tensor *             bias,
+                              const ggml_cuda_topk_moe_args & args) {
+    // Get device memory pointers
+    float * logits_d  = (float *) logits->data;
+    float * weights_d = (float *) weights->data;
+    int32_t * ids_d   = (int32_t *) ids->data;
+    float * bias_d    = bias ? (float *) bias->data : nullptr;
+
+    const int n_experts     = logits->ne[0];
+    const int n_rows        = logits->ne[1];
+    const int n_expert_used = weights->ne[1];
+
+    const bool with_norm = clamp != nullptr;
+
+    float clamp_val = -INFINITY;
+    if (clamp) {
+        clamp_val = ggml_get_op_params_f32(clamp, 0);
+    }
+
+    float scale_val = 1.0f;
+    if (scale) {
+        scale_val = ggml_get_op_params_f32(scale, 0);
+    }
+
+    topk_moe_config config;
+    config.use_sigmoid     = args.sigmoid;
+    config.with_norm       = with_norm;
+    config.delayed_softmax = args.delayed_softmax;
+
+    // In EP mode, each device only processes its local experts
+    // Need to coordinate across devices for the global top-k selection
+
+    const int device_id = ggml_cuda_get_device();
+    const int local_expert_start = ep_ctx.expert_offsets[device_id];
+    const int local_expert_end   = ep_ctx.expert_offsets[device_id + 1];
+    const int local_n_experts    = local_expert_end - local_expert_start;
+
+    if (local_n_experts == 0) {
+        // This device has no experts, skip computation
+        return;
+    }
+
+    // Launch local top-k on this device's experts
+    // Note: This is a simplified version; full implementation needs
+    // cross-device communication for global top-k selection
+
+    if (bias) {
+        launch_topk_moe_cuda<true>(ctx, logits_d + local_expert_start, weights_d, ids_d, bias_d,
+                                   n_rows, local_n_experts, n_expert_used, clamp_val, scale_val, config);
+    } else {
+        launch_topk_moe_cuda<false>(ctx, logits_d + local_expert_start, weights_d, ids_d, bias_d,
+                                    n_rows, local_n_experts, n_expert_used, clamp_val, scale_val, config);
+    }
+
+    // After local computation, perform AllReduce to get global top-k results
+    // This requires synchronization across devices
+    ggml_cuda_ep_allreduce(ep_ctx, weights_d, ggml_nbytes(weights), ctx.stream(), GGML_TYPE_F32);
+}
+
+bool ggml_cuda_should_use_topk_moe_ep(const ggml_tensor * gating_op,
+                                      const ggml_tensor * weights,
+                                      const ggml_tensor * logits,
+                                      const ggml_tensor * ids,
+                                      const ggml_cuda_ep_context & ep_ctx) {
+    // Check if EP mode is applicable
+    if (ep_ctx.n_devices <= 1) {
+        return ggml_cuda_should_use_topk_moe(gating_op, weights, logits, ids);
+    }
+
+    // Check if experts are distributed across devices
+    const int n_expert = ids->nb[1] / ids->nb[0];
+    if (n_expert != ep_ctx.n_experts_total) {
+        return false;
+    }
+
+    // Use the same checks as standard topk-moe
+    return ggml_cuda_should_use_topk_moe(gating_op, weights, logits, ids);
+}

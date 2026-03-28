@@ -30,6 +30,9 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int de
 // split tensor buffer that splits matrices by rows across multiple devices
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, const float * tensor_split);
 
+// Expert Parallelism buffer type for MoE models - distributes experts across multiple GPUs
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_expert_split_buffer_type(int main_device, const float * tensor_split, int64_t n_experts, int64_t expert_stride);
+
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(void);
 

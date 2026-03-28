@@ -340,8 +340,8 @@ static void llama_params_fit_impl(
                 }
             }
         }
-        if (mparams->split_mode == LLAMA_SPLIT_MODE_ROW) {
-            throw llama_params_fit_exception("changing weight allocation for LLAMA_SPLIT_MODE_ROW not implemented, abort");
+        if (mparams->split_mode == LLAMA_SPLIT_MODE_ROW || mparams->split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+            throw llama_params_fit_exception("changing weight allocation for LLAMA_SPLIT_MODE_ROW/EXPERT not implemented, abort");
         }
     }
     if (!tensor_buft_overrides) {
